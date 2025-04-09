@@ -1,0 +1,692 @@
+---
+title: "Untitled"
+author: "adam gordon-fennell"
+date: "2024-11-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# packages / parametres
+```{r}
+library(tidyverse)
+library(afex)
+library(emmeans)
+library(janitor)
+library(readxl)
+library(googlesheets4)
+library(ggh4x) # force_panelsizes
+library(arrow)
+library(zoo)
+library(lubridate)
+library(patchwork)
+library(ggbeeswarm)
+library(ggpubr) #r2 on correlation
+library(stats) #kernal filtering
+library(parallel)
+library(doParallel)
+library(plotly)
+library(data.table)
+
+source('./functions/r_plots.R')
+source('./functions/r_fp.R')
+source('./functions/r_head_fixed_processing.R')
+
+source('./functions/general.R')
+source('./functions/stats.R')
+source('./functions/pca.R')
+source('./functions/plotting_placements.R')
+source('./functions/analysis_peth.R')
+
+library(viridisLite)
+
+color_values_nacl <- inferno(5, begin = 0, end = 0.8)
+color_values_suc <- mako(5, begin = 0, end = 0.8)
+color_values_misc01 <-  c('black', 'grey', '#BCD634', '#34BCD6')
+color_values_misc02 <-  c('black', '#D634BC', '#BCD634', '#34BCD6')
+color_values_groupcombined <- c('darkgrey', '#CC2029', '#70BF46')
+color_values_regions <- c('#72BF45', '#CD202A', '#7B8137', '#000004FF', '#2A115CFF', '#6C1D81FF', '#AD347CFF', '#EA5661FF', '#FE9F6DFF')
+color_values_regions_da <- c('#000004FF', '#2A115CFF', '#6C1D81FF', '#AD347CFF', '#EA5661FF', '#FE9F6DFF')
+color_values_regions_da7 <- c("#000004FF", "#20114BFF", "#57157EFF", "#8C2981FF", "#C43C75FF", "#F1605DFF", "#FE9F6DFF")
+color_values_experiment_set <- c('#7edb00', '#007edb', '#db007e')
+color_values_predictors <- c("#dd5129", "#0f7ba2", "#43b284", "#fab255")
+
+
+key_set_id <- tibble(
+  set_id =       c('wrsuc', 'frsuc', 'wrnacl'),
+  set_id_label = c('WR:Suc','FR:Suc','WR:NaCl')
+)
+
+key_regions <- tibble(
+  region =       c('lha_gaba', 'lha_glut', 'lha_ratio', 'nac',   'nac_corr', 'nacsh_med', 'nac_shelllat', 'nacsh_lat',  'dms', 'dls', 'ts'),
+  region_label = c('LHA:GABA', 'LHA:Glut', 'LHA:Ratio', 'NAcCR', 'NAcCC',    'NAcShM',    'NAcShL',       'NAcShL',     'DMS', 'DLS', 'TS')
+)
+```
+
+# logs
+```{r}
+log_placements <- read_sheet('https://docs.google.com/spreadsheets/d/1dATNdE46yfeKJmNBi51yeO8Iycv4RaMlfdc8xS4YBiY', sheet = 'placements', na = c('na','NA',''))
+```
+
+
+# functions
+```{r}
+rename_predictors <- function(df){
+  df %>%
+    rename(
+      lick = lick_kernal,
+      trial = diagonal_true_trial, 
+      conc = diagonal_true_solution_conc_scaled_0_p1, 
+      history = diagonal_true_solution_conc_scaled_0_p1_history03
+      )
+}
+
+format_predictors <- function(df){
+  df %>%
+    mutate(predictor_label = case_when(
+      predictor == 'lick' ~ 'Lick',
+      predictor == 'trial' ~ 'Trial', 
+      predictor == 'conc' ~ 'Concentration',
+      predictor == 'history' ~ 'History'
+    )
+    ) %>%
+    mutate(predictor_label = predictor_label %>% factor(levels = c('Trial', 'Lick', 'Concentration', 'History')) )
+}
+
+
+gather_predictors_pvals <- function(df){
+  df %>%
+    gather('predictor', 'p_value', lick, trial, conc, history) %>%
+    mutate(predictor = factor(predictor, levels = c('lick', 'trial', 'conc', 'history')))
+}
+
+gather_predictors_deltar <- function(df){
+  df %>%
+    gather('predictor', 'deltar', lick, trial, conc, history) %>%
+    mutate(predictor = factor(predictor, levels = c('lick', 'trial', 'conc', 'history')))
+}
+
+format_stats <- function(df){
+  df %>%
+   mutate(sig = ifelse(p_value < 0.05, 1, 0))
+}
+
+```
+
+
+
+# import
+## data
+```{r}
+dir_sessions_combined <- "./data/sessions_combined_subject/"  # Change this to your actual directory
+
+
+
+analysis_output_dirs <- list.dirs(path = dir_sessions_combined, recursive = TRUE, full.names = TRUE)
+analysis_output_dirs <- analysis_output_dirs[grepl("analysis_output_glm$", analysis_output_dirs)]
+
+
+fns <- unlist(lapply(analysis_output_dirs, function(dir) {
+  list.files(path = dir, pattern = "zscoreblsub\\.csv$", full.names = TRUE)
+}))
+
+fns_deltar <- fns[fns %>% str_detect('deltar2')]
+fns_pvals <- fns[fns %>% str_detect('pvals')]
+```
+
+
+### import data
+```{r}
+combined_pvals <- bind_rows(lapply(fns_pvals, function(file) {
+  data <- read.csv(file)  # Read the CSV file
+  data$file_name <- file  # Add the file name as a column
+  return(data)
+}))
+
+combined_pvals <- combined_pvals %>%
+  mutate(file_name = file_name %>% str_remove(dir_sessions_combined)) %>%
+  separate(file_name, into = c('subject_set', 'region'), sep = '/analysis_output_glm/') %>%
+  mutate(region = region %>% str_remove('_zscoreblsub.csv'))%>%
+  mutate(region = region %>% str_remove('pvals_')) %>%
+  separate(subject_set, into = c('subject', 'set_id'), sep = '_') %>%
+  get_region_labels() %>%
+  format_set_id(key_set_id) %>%
+  rename_predictors() %>%
+  gather_predictors_pvals() %>%
+  format_stats()
+
+
+
+combined_deltlar <- bind_rows(lapply(fns_deltar, function(file) {
+  data <- read.csv(file)  # Read the CSV file
+  data$file_name <- file  # Add the file name as a column
+  return(data)
+}))
+
+combined_deltlar <- combined_deltlar %>%
+  mutate(file_name = file_name %>% str_remove(dir_sessions_combined)) %>%
+  separate(file_name, into = c('subject_set', 'region'), sep = '/analysis_output_glm/') %>%
+  mutate(region = region %>% str_remove('_zscoreblsub.csv'))%>%
+  mutate(region = region %>% str_remove('deltar2_'))%>%
+  separate(subject_set, into = c('subject', 'set_id'), sep = '_') %>%
+  get_region_labels() %>%
+  format_set_id(key_set_id)  %>%
+  rename_predictors() %>%
+  gather_predictors_deltar() 
+
+```
+
+
+### summarise data
+```{r}
+combined_pvals_summary_setid <- combined_pvals %>%
+  group_by(set_id, region, predictor) %>%
+  summarise(
+    count_subjects = n(),
+    count_sig = sum(sig),
+    .groups = 'drop'
+  ) %>%
+  mutate(sig_proportion = count_sig / count_subjects)
+
+
+combined_pvals_summary_overall <- combined_pvals %>%
+  group_by(region, predictor) %>%
+  summarise(
+    count_subjects = n(),
+    count_sig = sum(sig),
+    .groups = 'drop'
+  ) %>%
+  mutate(sig_proportion = count_sig / count_subjects)
+
+
+combined_deltlar_summary <- combined_deltlar %>%
+  group_by(set_id, region, predictor) %>%
+  summarise(
+    deltar_sem = sd(deltar) / sqrt(n()),
+    deltar_mean = deltar %>% mean(),
+    .groups = 'drop'
+  ) 
+```
+
+# figures
+## delta r
+```{r}
+dir_output <- './analysis_output/glm/'
+fn_stem <- 'glm_deltar'
+```
+
+
+```{r}
+plt_data <- combined_deltlar %>%
+  format_predictors() %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  filter(deltar >= 0)
+
+plt_data %>% 
+  ggplot(aes(region, deltar, color = set_id, group = set_id)) +
+  stat_summary(fun = 'mean', geom = 'line') +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  theme_ag01() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  scale_color_manual(values = color_values_experiment_set) +
+  facet_wrap(~predictor_label, nrow = 1, scales = 'free') + 
+  ylab(expression(Delta * R^2)) +
+  xlab('') +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3, 'cm'))
+
+save_pdf(dir_output, str_c(fn_stem, '_str_line_setid.pdf'),8,3)
+plt_data %>% write_csv(str_c(str_c(dir_output, fn_stem, '_str_line_setid.csv')))
+```
+
+```{r}
+stats_list_lick <- plt_data %>%
+  mutate(subject = subject %>% str_c(row_number())) %>%
+  filter(predictor == 'lick') %>%
+  aov_rm_two_between(NA,NA,'subject','deltar','region','set_id')
+
+stats_list_trial <- plt_data %>%
+  mutate(subject = subject %>% str_c(row_number())) %>%
+  filter(predictor == 'trial') %>%
+  aov_rm_two_between(NA,NA,'subject','deltar','region','set_id')
+
+stats_list_conc <- plt_data %>%
+  mutate(subject = subject %>% str_c(row_number())) %>%
+  filter(predictor == 'conc') %>%
+  aov_rm_two_between(NA,NA,'subject','deltar','region','set_id')
+
+stats_list_history <- plt_data %>%
+  mutate(subject = subject %>% str_c(row_number())) %>%
+  filter(predictor == 'history') %>%
+  aov_rm_two_between(NA,NA,'subject','deltar','region','set_id')
+
+
+df_anova <- stats_list_lick[[2]] %>% mutate(predictor = 'lick') %>%
+  bind_rows(stats_list_trial[[2]] %>% mutate(predictor = 'trial')) %>%
+  bind_rows(stats_list_conc[[2]] %>% mutate(predictor = 'conc')) %>%
+  bind_rows(stats_list_history[[2]] %>% mutate(predictor = 'history'))
+
+
+df_hsd <- stats_list_lick[[3]] %>% mutate(predictor = 'lick') %>%
+  bind_rows(stats_list_trial[[3]] %>% mutate(predictor = 'trial')) %>%
+  bind_rows(stats_list_conc[[3]] %>% mutate(predictor = 'conc')) %>%
+  bind_rows(stats_list_history[[3]] %>% mutate(predictor = 'history'))
+
+df_hsd <- df_hsd %>%
+  filter(contrast1_between1 == contrast2_between1) %>%
+  mutate(comp_set_id = ifelse(
+    ((contrast1_between2 == 'WR:Suc' | contrast2_between2 == 'WR:Suc') & (contrast1_between2 == 'FR:Suc' | contrast2_between2 == 'FR:Suc')),
+    'FR:Suc vs WR:Suc', 
+    NA
+    )) %>%
+    mutate(comp_set_id = ifelse(
+    ((contrast1_between2 == 'WR:Suc' | contrast2_between2 == 'WR:Suc') & (contrast1_between2 == 'WR:NaCl' | contrast2_between2 == 'WR:NaCl')),
+    'WR:NaCl vs WR:Suc', 
+    comp_set_id
+    )) %>%
+    mutate(comp_set_id = ifelse(
+    ((contrast1_between2 == 'FR:Suc' | contrast2_between2 == 'FR:Suc') & (contrast1_between2 == 'WR:NaCl' | contrast2_between2 == 'WR:NaCl')),
+    'WR:NaCl vs FR:Suc', 
+    comp_set_id
+    ))
+
+
+df_hsd %>%
+  format_predictors() %>%
+  rename(region = contrast1_between1) %>%
+  mutate(region = factor(region, levels = key_regions$region_label %>% unique())) %>%
+  filter(sig_text != '') %>%
+  ggplot(aes(region, comp_set_id, label = sig_symbol)) +
+  geom_text() +
+  facet_grid(.~predictor_label) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  force_panelsizes(rows = unit(1.5, 'cm'), cols = unit(3, 'cm'))
+
+
+save_pdf(dir_output, str_c(fn_stem, '_str_line_setid_hsd.pdf'),8,3)
+df_hsd %>% write_csv(str_c(str_c(dir_output, fn_stem, '_str_line_setid_hsd.csv')))
+
+
+df_anova %>% 
+  select(predictor, everything()) %>% 
+  write_csv(str_c(str_c(dir_output, fn_stem, '_str_line_setid_aov.csv')))
+```
+
+```{r}
+df_anova %>% 
+  select(predictor, everything()) %>%
+  select(predictor, effect, sig_symbol) %>%
+  spread(effect, sig_symbol)
+```
+
+
+```{r}
+combined_deltlar %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  filter(set_id == 'WR:NaCl') %>%
+  format_predictors() %>%
+  group_by(set_id, region, predictor_label) %>%
+  filter(deltar >= 0) %>%
+  summarise(deltar = mean(deltar)) %>%
+  group_by(predictor_label) %>%
+  mutate(deltar = deltar - min(deltar)) %>%
+  mutate(deltar = deltar / max(deltar)) %>%
+  ggplot(aes(region, predictor_label,size = deltar)) +
+  geom_point() +
+  theme_ag01() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  coord_cartesian(xlim = c(0.25, 7.75), ylim = c(0.5, 4.5), expand = F) +
+  scale_x_discrete(limits=rev) +
+  scale_y_discrete(limits=rev) +
+  scale_size_continuous(range = c(1,6)) +
+  facet_grid(.~set_id) +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(6, 'cm')) +
+  xlab('') 
+```
+
+
+
+```{r}
+#stats comparision matrix?
+
+plt_hsd_matrix_2contrasts_between <- function(df_pairs, heat_limits = NA){
+  
+  
+  n_contrasts <- df_pairs %>%
+    pull(contrast1_between) %>%
+    unique() %>%
+    length()
+  
+  df_pairs <- df_pairs %>%
+    rename(contrast1_between_org = contrast1_between, 
+           contrast2_between_org = contrast2_between) %>%
+    rename(contrast2_between = contrast1_between_org, 
+           contrast1_between = contrast2_between_org
+    ) %>%
+    mutate(effect_size = -effect_size) %>%
+    bind_rows(df_pairs,.)
+  
+  if(sum(is.na(heat_limits))){
+    max_abs_d <- max(abs(df_pairs$effect_size))
+    
+    heat_limits <- c(-max_abs_d, max_abs_d)
+  }
+  
+  plt <- df_pairs %>%
+    mutate(sig_symbol = ifelse(sig_symbol == 'n.s.', '', sig_symbol)) %>%
+    ggplot(aes(contrast2_between, contrast1_between, fill = effect_size, label = sig_symbol)) +
+    geom_tile() +
+    geom_text(size = 3) +
+    theme_ag01() +
+    scale_fill_gradientn(colors = c('#0016EC', 'white', '#EC008C'), limits = heat_limits, oob = scales::squish) + 
+    theme(
+      axis.title.x = element_blank(), 
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)
+    ) +
+    coord_cartesian(xlim = c(0.5, n_contrasts + 1.5), ylim = c(0.5, n_contrasts + 1.5), expand = F)
+  
+  return(plt)
+}
+
+plt_line_pairwise_between <- function(df, dir_output, fn_stem, var_id = 'subject', var_dv, var_within, ylims, heat_range = NA){
+  
+  n_within <- df %>%
+    pull(!!as.name(var_within)) %>% 
+    unique() %>%
+    length()
+
+  levels_var_within <- df %>%
+  arrange(!!as.name(var_within)) %>%
+  unique() %>%
+  pull(!!as.name(var_within)) %>%
+  unique()
+  
+  pltline <- df %>%
+    ggplot(aes(region, !!as.name(var_dv))) +
+    geom_line(aes(group = !!as.name(var_id)), alpha = 1/4) +
+    stat_summary(fun = 'mean', geom = 'bar', aes(group = 1)) +
+    stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = 1), width = 0) +
+    theme_ag01() +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+    coord_cartesian(xlim = c(0.25, n_within + 0.75), ylim = ylims, expand = F)
+  
+  
+  stats_results <- df %>%
+    aov_rm_one_between(dir_output,fn_stem,var_id, var_dv, var_within)
+  
+  df_pairs <- stats_results[[3]] %>%
+    mutate(contrast1_between = contrast1_between %>% factor(levels = levels_var_within)) %>%
+    mutate(contrast2_between = contrast2_between %>% factor(levels = levels_var_within)) 
+  
+  
+  plt_comparisions <- plt_hsd_matrix_2contrasts_between(df_pairs, heat_range) 
+  
+  
+  pltline + plt_comparisions +
+    plot_layout(nrow = 1, widths = unit(3,'cm'), heights = unit(3, 'cm'))
+  
+  save_pdf(dir_output, str_c(fn_stem, '_plt_line_pairwise.pdf'), 10, 5)
+  
+  return(list(stats_results, pltline, plt_comparisions))
+}
+```
+
+
+
+
+```{r, fig.width = 12, fig.height = 12}
+plt_data_nacl <- combined_deltlar %>%
+  format_predictors() %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  filter(deltar >= 0) %>%
+  filter(set_id == 'WR:NaCl')
+
+list_conc <- plt_line_pairwise_between(
+      df = plt_data_nacl %>%
+        filter(predictor == 'conc')  %>%
+        mutate(subject = subject %>% str_c('_', row_number())) ,
+      dir_output = './analysis_output/glm/',
+      fn_stem = str_c(fn_stem, '_str_overall_line_conc'),
+      var_dv = 'deltar',
+      var_within = 'region' ,
+      ylims = c(0,0.12), 
+      heat_range = c(-2.5, 2.5)
+    )
+
+list_lick <- plt_line_pairwise_between(
+      df = plt_data_nacl %>%
+        filter(predictor == 'lick')  %>%
+        mutate(subject = subject %>% str_c('_', row_number())) ,
+      dir_output = './analysis_output/glm/',
+      fn_stem = str_c(fn_stem, '_str_overall_line_lick'),
+      var_dv = 'deltar',
+      var_within = 'region' ,
+      ylims = c(0,0.1), 
+      heat_range = c(-2.5, 2.5)
+    )
+
+list_history <- plt_line_pairwise_between(
+      df = plt_data_nacl %>%
+        filter(predictor == 'history')  %>%
+        mutate(subject = subject %>% str_c('_', row_number())) ,
+      dir_output = './analysis_output/glm/',
+      fn_stem = str_c(fn_stem, '_str_overall_line_history'),
+      var_dv = 'deltar',
+      var_within = 'region' ,
+      ylims = c(0,0.015), 
+      heat_range = c(-2.5, 2.5)
+    )
+
+list_trial <- plt_line_pairwise_between(
+      df = plt_data_nacl %>%
+        filter(predictor == 'trial')  %>%
+        mutate(subject = subject %>% str_c('_', row_number())) ,
+      dir_output = './analysis_output/glm/',
+      fn_stem = str_c(fn_stem, '_str_overall_line_trial'),
+      var_dv = 'deltar',
+      var_within = 'region' ,
+      ylims = c(0,0.04), 
+      heat_range = c(-2.5, 2.5)
+    )
+
+(list_trial[[2]] +  ylab(expression(Delta * R^2))) + list_trial[[3]] +
+  (list_lick[[2]] +  ylab(expression(Delta * R^2)))+ list_lick[[3]] +
+  (list_conc[[2]] +  ylab(expression(Delta * R^2)))+ list_conc[[3]] +
+  (list_history[[2]] +  ylab(expression(Delta * R^2)))+ list_history[[3]] +
+  plot_layout(widths = unit(c(2,3), 'cm'),
+              heights = unit(3, 'cm'),
+              ncol = 2)
+
+save_pdf(dir_output, str_c(fn_stem, '_str_overall_linefaceted.pdf'),4,8)
+plt_data_nacl %>% write_csv(str_c(dir_output, fn_stem, '_str_overall_linefaceted_data.csv'))
+
+(list_trial[[3]] + ggtitle('Trial')) +
+  (list_lick[[3]] + ggtitle('Lick')) +
+  (list_conc[[3]] + ggtitle('Concentration')) +
+  (list_history[[3]] + ggtitle('History')) +
+  plot_layout(widths = unit(3, 'cm'), 
+              heights = unit(3, 'cm'),
+              ncol = 4, 
+              guides = 'collect')
+
+save_pdf(dir_output, str_c(fn_stem, '_str_overall_line_hsd.pdf'),8,3)
+```
+
+```{r}
+combined_stats_results_aov_main <- list_conc[[1]][[2]] %>% mutate(predictor = 'concentration') %>%
+  bind_rows(list_lick[[1]][[2]] %>% mutate(predictor = 'lick')) %>%
+  bind_rows(list_history[[1]][[2]] %>% mutate(predictor = 'history')) %>%
+  bind_rows(list_trial[[1]][[2]] %>% mutate(predictor = 'trial')) 
+
+combined_stats_results_aov_main %>% 
+  select(predictor, everything()) %>%
+  write_csv(str_c(dir_output, fn_stem, '_str_overall_linefaceted_stats_aov.csv'))
+
+combined_stats_results_aov_hsd <- list_conc[[1]][[3]] %>% mutate(predictor = 'concentration') %>%
+  bind_rows(list_lick[[1]][[3]] %>% mutate(predictor = 'lick')) %>%
+  bind_rows(list_history[[1]][[3]] %>% mutate(predictor = 'history')) %>%
+  bind_rows(list_trial[[1]][[3]] %>% mutate(predictor = 'trial')) 
+
+combined_stats_results_aov_hsd %>% 
+  select(predictor, everything()) %>%
+  write_csv(str_c(dir_output, fn_stem, '_str_overall_linefaceted_stats_hsd.csv'))
+```
+
+'placement_vs_deltar'
+
+### placements
+```{r}
+plt_data <- combined_deltlar %>%
+  group_by(subject, region, predictor) %>%
+  filter(set_id == 'WR:NaCl') %>%
+  filter(!region %>% str_detect('LHA'))
+
+
+```
+
+
+```{r}
+
+
+
+fn_stem <- 'placement_vs_deltar'
+
+source('./functions/plotting_placements.R')
+
+modify_plt_corr <- function(plt, loop_predictor){
+  plt <- plt +
+    theme(strip.text = element_blank()) 
+  
+    if(loop_predictor %in% c('lick', 'trial', 'conc')){
+      plt <- plt %>%
+        remove_x_all()
+    }
+  
+  
+  
+  return(plt)
+}
+
+for(loop_predictor in unique(plt_data$predictor)){
+    
+  fn_stem02 <-  str_c(fn_stem,'_', loop_predictor)
+  
+  df <- plt_data %>%
+    filter(predictor == loop_predictor) %>%
+    join_placements() %>%
+    filter(deltar >= 0) %>%
+    select(subject, predictor, region, deltar, starts_with('hit')) 
+  
+  var_color <- 'deltar'
+  
+  # correlations
+  if(loop_predictor == 'lick'){ylim_all <- c(0,0.2)}
+  if(loop_predictor == 'trial'){ylim_all <- c(0,0.06)}
+  if(loop_predictor == 'conc'){ylim_all <- c(0,0.2)}
+  if(loop_predictor == 'history'){ylim_all <- c(0,0.03)}
+  
+  if(loop_predictor == 'lick'){ylim_color <- c(0,0.1)}
+  if(loop_predictor == 'trial'){ylim_color <- c(0,0.0375)}
+  if(loop_predictor == 'conc'){ylim_color <- c(0,0.075)}
+  if(loop_predictor == 'history'){ylim_color <- c(0,0.012)}
+  
+  var_color_name <- 'Dealta R'
+  
+  scale_color_3d <- 0.75
+  
+   plt_str(
+      df = df,
+      var_color = !!sym(var_color),
+      var_color_name = var_color_name,
+      vars_facet = c('.','.'),
+      plt_plane = 'sagittal',
+      plt_dim_base = 3,
+      color_limits = ylim_color
+      )
+
+    save_pdf(str_c(dir_output, 'placements/'), str_c(fn_stem02, '_sagittal.pdf'),6,6)
+
+    plt_str(
+      df = df,
+      var_color = !!sym(var_color),
+      var_color_name = var_color_name,
+      vars_facet = c('.','.'),
+      plt_plane = 'horizontal',
+      plt_dim_base = 3,
+      color_limits = ylim_color
+      )
+
+    save_pdf(str_c(dir_output, 'placements/'), str_c(fn_stem02, '_horizontal.pdf'),6,6)
+
+    plt_str(
+      df = df,
+      var_color = !!sym(var_color),
+      var_color_name = var_color_name,
+      vars_facet = c('.','.'),
+      plt_plane = 'coronal',
+      plt_dim_base = 3,
+      color_limits = ylim_color
+      )
+
+    save_pdf(str_c(dir_output, 'placements/'), str_c(fn_stem02, '_coronal.pdf'),6,6)
+
+    
+    plt_str_3d(
+      df = df,
+      var_color = var_color,
+      color_limits = ylim_color,
+      dir_output = str_c(dir_output, 'placements/'),
+      fn_stem = str_c(fn_stem02),
+      toggle_save = 1
+      )
+  
+  plt_list <- plt_corr_generic(
+    df = df, 
+    ylim_all = ylim_all, 
+    xlim_ap = c(-3, 0, 3),
+    xlim_ml = c(0, 2, 4),
+    xlim_dv = c(-6, -4, -2),
+    var_dep = var_color, 
+    var_dep_label = var_color_name, 
+    plt_dims = c(2.5, 2.5)
+  )
+  
+  
+  plt_list[['stats_output']] 
+  
+  # run pearsons
+  plt_list[['AP']] %>% modify_plt_corr(loop_predictor) +
+    plt_list[['ML']] %>% modify_plt_corr(loop_predictor) + 
+    plt_list[['DV']] %>% modify_plt_corr(loop_predictor) +
+    plot_layout(nrow = 1, widths = unit(3, 'cm'), heights = unit(3, 'cm'), guides = 'collect')
+  
+  save_pdf(
+    str_c(dir_output, 'placements/'),
+    str_c(fn_stem02, '_corr', '.pdf'),
+    12, 
+    6
+  )
+  
+  df %>%
+    write_csv(str_c(dir_output, 'placements/', fn_stem02, '_corr_data.csv'))
+  
+  plt_list[['stats_output']]  %>%
+    write_csv(str_c(dir_output, 'placements/', fn_stem02, '_corr_stats.csv'))
+
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+

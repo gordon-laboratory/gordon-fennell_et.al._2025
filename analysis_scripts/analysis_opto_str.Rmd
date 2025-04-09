@@ -1,0 +1,1123 @@
+---
+title: "npm_preprocessing"
+author: "adam gordon-fennell"
+date: '2023-05-18'
+output: html_document
+---
+
+todo:
+- check on cat6 connectivity between boxes and clock arduino (ids are not as expected)
+- increase sampling rate (many samples below 20Hz)
+- resample time prior to exporting dataset
+- convert arduino beh dataset to system time using clock approach
+- determine what is in the TDT output and replicate... 
+- 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(afex)
+library(emmeans)
+library(janitor)
+library(readxl)
+library(googlesheets4)
+library(ggh4x) # force_panelsizes
+library(arrow)
+library(zoo)
+library(lubridate)
+library(patchwork)
+library(ggbeeswarm)
+library(ggpubr) #r2 on correlation
+library(rstatix)
+library(plotly)
+library(viridis)
+
+source('.//functions/r_plots.R')
+source('.//functions/r_stats.R')
+source('.//functions/r_general.R')
+source('.//functions/r_fp.R')
+source('./functions/r_head_fixed_processing.R')
+```
+
+# setup
+```{r}
+dir_npm_raw <- './data//data_npm/data_raw/'
+dir_npm_extracted <- './data//data_npm/data_extracted/'
+dir_npm_processed <- './data//data_npm/data_processed/'
+  
+log_npm <- read_sheet('https://docs.google.com/spreadsheets/d/1v-G8GHYPGtJWXARZYqcndO03d23umsTo98BAb5_WnrY/edit#gid=0', na = c('', 'NA'))
+
+log_data_stim_char_param <- read_sheet("https://docs.google.com/spreadsheets/d/1GOVg5to5MliU6TFIBCR9YUZYx-b4dYGB-qd2uiX7Vrc/edit#gid=0", sheet = 'stim_parameters')
+
+log_data_stim <- read_sheet("https://docs.google.com/spreadsheets/d/1GOVg5to5MliU6TFIBCR9YUZYx-b4dYGB-qd2uiX7Vrc/edit#gid=0")
+
+manual_experiments <- 'abw'
+
+```
+
+# pre-processsing
+## arduino
+```{r}
+# directories 
+dir_arduino_extraction <- './data/arduino/extracted/'
+dir_arduino_processed <- './data/arduino/processed/'
+dir_arduino_raw <- './data/arduino/raw/'
+dir_output <- './analysis_output/'
+
+key_events <- read_sheet('https://docs.google.com/spreadsheets/d/1e3ltGi7oNBvIpCgUCcZL2Jm8nmv8eVBoPXvdoowNZx4') 
+log_subject <- read_sheet("https://docs.google.com/spreadsheets/d/17GC2tzKHKuWCZAyj84ubsPTvLsfepKFjl_LnaZ8jxdw/edit#gid=0", na = 'NA', sheet = 'subject')
+```
+
+
+
+
+```{r, meassage = FALSE}
+file_format_output <- 'csv'
+
+manual_blocknames <- log_npm %>%
+  filter(experiment == 'abw') %>%
+  filter(procedure %>% str_detect('opto_char')) %>%
+  select(blockname) %>%
+  unique() %>%
+  pull(blockname)
+
+extract_serial_output(dir_arduino_raw, key_events, dir_arduino_extraction, manual_experiments, manual_blocknames = manual_blocknames, file_format_output, overwrite = 0)
+```
+
+
+## npm
+```{r, meassage = FALSE}
+manual_sessions_to_process <- log_npm %>%
+  filter(experiment == manual_experiments) %>%
+  filter(procedure %>% str_detect('opto_char')) %>%
+  filter(exclude != 1) %>%
+  pull(session_name) %>% unique() 
+
+manual_sessions_to_process <- 
+  manual_sessions_to_process[
+    manual_sessions_to_process %>% str_detect('08_12') |
+      manual_sessions_to_process %>% str_detect('08_14') |
+      manual_sessions_to_process %>% str_detect('08_15')
+      ]
+
+npm_extract(log_npm, dir_npm_raw, dir_npm_extracted, manual_session_names = manual_sessions_to_process, overwrite = 0, filter_red_opto_sd = 5)
+
+fp_preprocess_npm(
+  dir_npm_extracted,
+  dir_npm_processed,
+  log_npm,
+  manual_session_names = manual_sessions_to_process,
+  overwrite = 0,
+  dir_arduino_extracted = './data/arduino/extracted/'
+)
+```
+
+
+## tdt
+```{r}
+# filter events
+# error in ttl recoridng with multiple pulses instead of a single pulse per stim period, filtered here to match 50 trials of stim in npm
+
+redo_filtering <- 0
+
+if(redo_filtering){
+  fns <- list.files('./data//data_fp/data_extracted')
+  fns <- fns[fns %>% str_detect('abw')]
+  fns <- fns[fns %>% str_detect('_epocs_data.feather')]
+  
+  for(fn in fns){
+    df <- read_feather(str_c('./data//data_fp/data_extracted/', fn))
+    
+    df <- df %>%
+      filter(name == 'PC1/') %>%
+      mutate(dur = offset - onset)  %>%
+      filter(dur > 0.9) %>%
+      
+      mutate(iti = onset - lag(onset)) %>%
+      filter(iti > 0.5 | is.na(iti)) %>%
+      mutate(trial_num = row_number()) %>%
+      filter(trial_num > max(trial_num) - 50) %>%
+      select(-dur, -iti, -trial_num)
+    
+    df %>% 
+      write_feather(str_c('./data//data_fp/data_extracted/', fn))
+  }
+}
+```
+
+```{r, echo = TRUE}
+dir_tdt_extracted <- './data//data_fp/data_extracted'
+dir_tdt_processed <- './data//data_fp/data_processed'
+
+log_tdt <- read_sheet("https://docs.google.com/spreadsheets/d/1-_aV_inR-hg108or2Pj2K7iWZRnt8pg4-IZNe1sLVQ8", na = 'NA') 
+```
+
+```{r}
+fp_preprocess(dir_tdt_extracted, dir_tdt_processed, log_tdt, manual_experiments = c('abw'), manual_blocknames = c('2024_02_02_abw01'), overwrite = 0)
+```
+
+## functions
+```{r}
+key_regions <- tibble(
+  region_temp = c('nac', 'dms', 'dls', 'ts'),
+  region_label = c('NAcCR', 'DMS', 'DLS', 'TS')
+)
+
+format_regions <- function(df, var_region, key_regions){
+  df %>%
+    rename(region_temp = !!as.name(var_region)) %>%
+    left_join(key_regions) %>%
+    mutate(region_label = factor(region_label, levels = key_regions$region_label)) %>%
+    select(-region_temp) %>%
+    rename(!!var_region := region_label) %>%
+    select(!!var_region, everything())
+}
+```
+
+
+```{r}
+library(corrplot)
+library(Hmisc)
+
+tidy_cor_output_reshape <- function(df, n_table, var_name){
+  df_tidy <- df[[n_table]] %>%
+    as_tibble()
+  
+  df_tidy <- df_tidy %>%
+    mutate(var_y = colnames(df_tidy)) %>%
+    gather('var_x', !!as.name(var_name), -var_y) 
+  
+  return(df_tidy)
+}
+
+tidy_cor_output <- function(df){
+  tidy_cor_output_reshape(df, 1, 'r') %>%
+    left_join(tidy_cor_output_reshape(df, 2, 'n'), by = c("var_y", "var_x")) %>%
+    left_join(tidy_cor_output_reshape(df, 3, 'p'), by = c("var_y", "var_x"))
+}
+
+
+get_cormatrix <- function(df){
+  df_corr = rcorr(as.matrix(df))
+  tidy_cor_output(df_corr)
+}
+
+tidy_cormatrix <- function(df, var_cors, var_groups = NA){
+  require(Hmisc)
+  
+  df <- df %>%
+    ungroup()
+
+
+  if(sum(is.na(var_groups)) > 0){
+    df <- df %>% select(var_cors)
+  
+    df %>%
+      group_modify(~ get_cormatrix(.))
+    
+  } else {
+    df <- df %>% select(var_cors, var_groups)
+    
+    df %>%
+      group_by_at(var_groups) %>%
+      group_modify(~ get_cormatrix(.))
+    
+  }
+}
+
+```
+
+
+```{r}
+filter_counterbalance_days <- function(df){
+  df %>%
+    filter(
+      blockname %>% str_detect('2024_01_16') | #cohort1
+      blockname %>% str_detect('2024_01_18') | 
+      blockname %>% str_detect('2024_01_17') |
+      blockname %>% str_detect('2024_01_19') |
+      blockname %>% str_detect('2024_01_20') |
+      blockname %>% str_detect('2024_01_24') |
+      blockname %>% str_detect('2024_01_25') |
+      blockname %>% str_detect('2024_08_05') | #cohort 2
+      blockname %>% str_detect('2024_08_06') |
+      blockname %>% str_detect('2024_08_07') |
+      blockname %>% str_detect('2024_08_08') |
+      blockname %>% str_detect('2024_08_09') |
+      blockname %>% str_detect('2024_08_12') |
+      blockname %>% str_detect('2024_08_13') |
+      blockname %>% str_detect('2024_08_14') |
+      blockname %>% str_detect('2024_08_15')
+  )
+}
+```
+
+# str opto stim
+```{r}
+dir_output <- './analysis_output_final/opto_characterization/'
+
+
+color_values_regions <- c('#000004FF', '#AD347CFF', '#EA5661FF', '#FE9F6DFF')
+                        #  NAcCorR      DMS        DLS        TS
+```
+
+## import / process
+### opto stim ids
+```{r}
+# filter to first 4 sessions
+import_fns <-  log_npm %>%
+  filter(exclude == 0) %>%
+  filter_counterbalance_days() %>%
+  filter(experiment == manual_experiments) %>%
+  pull(blockname) %>% unique() 
+
+
+stim_params <- return_stim_params(import_fns, dir_arduino_extraction, file_format_output) 
+
+stim_params <- stim_params %>%
+  select(blockname, stim_num, trial_stim_frequency) %>%
+  filter(trial_stim_frequency != 0) %>%
+  arrange(blockname, stim_num) %>%
+  group_by(blockname) %>%
+  mutate(event_number_arduino = row_number())
+```
+
+```{r}
+df_stim_in_dataset <- log_data_stim %>%
+  filter(blockname %in% import_fns) %>%
+  select(subject, date, region_stim) 
+
+df_stim_in_dataset %>%
+  group_by(subject) %>%
+  summarise(count = n())
+
+df_stim_in_dataset %>%
+  ggplot(aes(region_stim, subject)) +
+  geom_point(size = 3)
+
+```
+- note, dms missing for abw03
+
+
+### npm
+```{r}
+data_list <- combined_import(import_directory = dir_npm_processed, 
+                             filter_strings = import_fns,
+                             prefixes = NA,
+                             suffixes = c('streams_session.feather', 'streams_peth.feather', 'events.feather'), 
+                             verbose = 0
+                             )
+
+
+streams      <- data_list[[1]] %>% filter(!blockname %>% str_detect('nolaser')) %>% filter(signal_wavelength == 470)
+streams_peth <- data_list[[2]] %>% filter(!blockname %>% str_detect('nolaser')) %>% filter(signal_wavelength == 470) 
+events       <- data_list[[3]] %>% filter(!blockname %>% str_detect('nolaser'))
+
+```
+
+
+```{r}
+filter_subjects <-  function(df){
+  df %>%
+    left_join(log_npm %>% select(blockname, subject) %>% unique()) %>%
+    filter(!subject %in% c('abw03', 'abw10')) %>%
+    select(-subject)
+}
+
+streams <- streams %>%  filter_subjects()
+streams_peth <- streams_peth %>% filter_subjects()
+events <- events %>% filter_subjects()
+```
+
+
+```{r}
+events %>%
+  ungroup() %>%
+  select(blockname) %>%
+  unique() %>%
+  left_join(log_npm %>% select(blockname, subject) %>% unique()) %>%
+  group_by(subject) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(count, subject)) +
+  geom_point()
+```
+- verified 09/18/24: all subjects have 4 sessions in analysis (1 for each stimulation region)
+
+
+```{r}
+streams <- streams %>% 
+    mutate(subject = blockname %>% str_sub(12,16))
+
+streams_peth <- streams_peth %>% 
+    mutate(subject = blockname %>% str_sub(12,16))
+
+streams_peth <- streams_peth %>%
+  left_join(log_npm %>% select(blockname, branch_id, region)) %>%
+  mutate(region = region %>% factor(levels = c('nac', 'dms', 'dls', 'ts'))) 
+
+streams_peth <- streams_peth %>%
+  left_join(log_subject %>% select(subject, line)) %>%
+  filter(time_rel > -3, time_rel < 9)
+```
+
+
+```{r}
+events <- events %>%
+  group_by(blockname) %>%
+  arrange(blockname, event_ts) %>%
+  filter(event_id_char == 'trial_start') %>%
+  rename(stim_num = event_number) %>%
+  left_join(stim_params, by = c("blockname", "stim_num"))
+
+
+events %>%
+  select(blockname, event_ts, trial_stim_frequency) %>%
+  filter(!is.na(trial_stim_frequency)) %>%
+  group_by(blockname, trial_stim_frequency) %>%
+  summarise(count = n()) %>%
+  mutate(trial_stim_frequency = factor(trial_stim_frequency, levels = c(1,2,5,10,20))) %>%
+  ggplot(aes(trial_stim_frequency, blockname, fill = count)) +
+  geom_tile()
+  
+```
+- verified 09/18/24: 10 trials for each stimulation frequency in all sessions
+
+```{r}
+streams_peth <- streams_peth %>%
+  rename(stim_num = event_number) %>%
+  left_join(
+    events %>%
+      select(blockname, stim_num, trial_stim_frequency)) %>%
+  filter(!is.na(trial_stim_frequency))
+
+
+# create z-score based on pre-stimulation window
+local_zs_window <- c(-3, 0)
+
+streams_peth <- streams_peth %>%
+  group_by(blockname, signal_wavelength, region) %>%
+    filter(time_rel > local_zs_window[1], time_rel < local_zs_window[2]) %>%
+    summarise(
+      delta_signal_poly_local_bl_mu = mean(delta_signal_poly),
+      delta_signal_poly_local_bl_sd = sd(delta_signal_poly),
+      delta_control_poly_local_bl_mu = mean(delta_control_poly),
+      delta_control_poly_local_bl_sd = sd(delta_control_poly),
+      .groups = 'drop'
+      ) %>%
+    left_join(streams_peth, ., by = c("blockname", "signal_wavelength", "region")) %>%
+    mutate(
+      delta_signal_poly_zscore_local = (delta_signal_poly - delta_signal_poly_local_bl_mu) / delta_signal_poly_local_bl_sd,
+      delta_control_poly_zscore_local = (delta_control_poly - delta_control_poly_local_bl_mu) / delta_control_poly_local_bl_sd
+      ) %>%
+    select(-delta_signal_poly_local_bl_mu, -delta_signal_poly_local_bl_sd, -delta_control_poly_local_bl_mu, -delta_control_poly_local_bl_sd)
+
+
+# join in stimulation region
+streams_peth <- streams_peth %>%
+  left_join(log_data_stim %>% select(blockname, region_stim)) %>%
+  mutate(region_stim = region_stim %>% factor(levels = c('nac', 'dms', 'dls', 'ts'))) 
+
+
+# remove NA trial_stim_frequency trials (0Hz)
+streams_peth <- streams_peth %>%
+  filter(!is.na(trial_stim_frequency))
+
+events <- events %>%
+  filter(!is.na(trial_stim_frequency))
+```
+
+
+```{r}
+streams_peth %>%
+  filter(time_rel == 0) %>%
+  filter(branch_id == 1) %>%
+  group_by(blockname, trial_stim_frequency) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  select(count) %>%
+  unique()
+```
+- verified 09/18/24: streams_peth - 10 trials for each stimulation frequency in all sessions
+
+
+```{r}
+var_iv <- 'delta_signal_poly_zscore_local'
+
+# baseline subtract
+streams_peth <- streams_peth %>%
+  filter(time_rel > -3, time_rel < 0) %>%
+  group_by(blockname, stim_num, region_stim, region, signal_wavelength) %>%
+  summarise(bl = mean(!!as.name(var_iv)), .groups = 'drop') %>%
+  left_join(streams_peth,.) %>%
+  mutate(!!as.name(var_iv) := !!as.name(var_iv) - bl) %>%
+  select(-bl)
+
+# format streams_peth
+streams_peth <- streams_peth %>%
+  format_regions('region', key_regions) %>%
+  format_regions('region_stim', key_regions) %>%
+  left_join(log_subject %>% select(subject, line), by = join_by(subject, line))
+
+# create summary based on 0.5s post stimulation window
+streams_peth_summary <- streams_peth %>%
+  filter(time_rel > 3, time_rel < 3.5) %>% 
+  group_by(blockname, subject, region_stim, trial_stim_frequency, region) %>%
+  summarise(
+    delta_signal_poly_zscore_local = mean(delta_signal_poly_zscore_local),
+    .groups = 'drop') %>%
+  mutate(trial_stim_frequency = as.character(trial_stim_frequency) %>% factor(levels = c(1,2,5,10,20,40)))
+
+streams_peth_summary_group <- streams_peth_summary %>%
+  group_by(trial_stim_frequency, region_stim, region) %>%
+  summarise(
+    count_subjects = n(),
+    delta_signal_poly_zscore_local = mean(delta_signal_poly_zscore_local),
+    .groups = 'drop') %>%
+  mutate(trial_stim_frequency = as.character(trial_stim_frequency) %>% factor(levels = c(1,2,5,10,20,40)))
+```
+
+
+```{r}
+
+```
+
+## plot / analyze
+### trace: time vs zscore 20Hz
+```{r}
+fn_stem <- 'trace_tm_vs_zscore_20hz'
+  
+data_plt <- streams_peth %>%
+  filter(trial_stim_frequency == 20) %>%
+  mutate(time_set = ifelse((time_rel > -3 & time_rel < 0), 'pre', NA)) %>%
+  mutate(time_set = ifelse((time_rel > 3 & time_rel < 9), 'post', time_set)) %>%
+  filter(!is.na(time_set)) %>%
+  select(blockname, branch_id, region, region_stim, stim_num, time_rel, time_set, delta_signal_poly_zscore_local)
+
+plt <- data_plt %>%
+  ggplot(aes(time_rel, delta_signal_poly_zscore_local, group = interaction(region, time_set), color = region, fill = region)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  stat_summary(fun.data = 'mean_se', geom = 'ribbon', color = NA, alpha = 1/4) +
+  stat_summary(fun = 'mean', geom = 'line') +
+  facet_wrap(.~region_stim, scales = 'free', nrow = 1) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  scale_fill_manual(values = color_values_regions) +
+  force_panelsizes(cols = unit(3,'cm'), rows = unit(4, 'cm'))
+
+plt <- plt  %>%
+  add_scale_bar(
+    origin = c(-3, -0), 
+    x_len = 1, 
+    y_len = 1
+  )
+
+plt
+
+save_pdf(dir_output, str_c(fn_stem,'.pdf'),22,12)
+
+data_plt %>%
+  write_csv(str_c(dir_output, fn_stem, '_data.csv'))
+```
+
+
+### heat: frequency vs region
+```{r}
+fn_stem <- 'heat_frequency_vs_region'
+
+data_plt <- streams_peth_summary_group
+
+plt <- streams_peth_summary_group %>%
+  ggplot(aes(trial_stim_frequency, region, fill = delta_signal_poly_zscore_local)) +
+  geom_tile() +
+  #geom_hline(yintercept = 3.5, size = 1) +
+  scale_fill_gradientn(colors = c('blue', 'white', 'red'), limits = c(-4,4), oob = scales::squish) +
+  theme_ag01() +
+  facet_grid(.~region_stim) +
+  ylab('Region') +
+  xlab('Stimulation Frequency (Hz)') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(0.5, 4.5), expand = F) +
+  theme(panel.spacing = unit(2, "lines")) +
+  force_panelsizes(cols = unit(2,'cm'), rows = unit(3, 'cm'))
+
+plt
+
+save_pdf(dir_output, str_c(fn_stem,'.pdf'),22,12)
+
+data_plt %>%
+  write_csv(str_c(dir_output, fn_stem, '_data.csv'))
+```
+
+#### stats: frequency response for each area 
+```{r}
+var_dv <- 'delta_signal_poly_zscore_local'
+
+plt_data <- streams_peth_summary 
+
+
+first_loop <- 1
+
+for(id_region_stim in key_regions$region_label){
+  for(id_region_rec in key_regions$region_label){
+
+    plt_data_wide <- plt_data %>%
+      filter(region_stim == id_region_stim,
+             region == id_region_rec) %>%
+      select(subject, trial_stim_frequency, !!as.name(var_dv)) %>%
+      spread(trial_stim_frequency, !!as.name(var_dv)) 
+    
+    result <- friedman.test(as.matrix(plt_data_wide[, -1]))
+    
+    result_df <- tidy(result) %>%
+      clean_names() %>%
+      mutate(region_stim = id_region_stim,
+             region = id_region_rec) %>%
+      select(region_stim, region, everything())
+    
+    if(first_loop){
+      result_df_combined <- result_df
+      first_loop = 0
+    } else {
+      result_df_combined <- result_df %>% bind_rows(result_df_combined,.)
+      
+    }
+  }
+}
+
+result_df_combined <- result_df_combined %>%
+  mutate(
+    region = region %>% factor(levels = key_regions$region_label),
+    region_stim = region_stim %>% factor(levels = key_regions$region_label)
+  ) %>%
+  mutate(
+    p_value_notadjusted = p_value,
+    p_value = p_value *4)%>% # correct for multiple comparisions
+  quick_sig() 
+
+result_df_combined %>%
+  write_csv(str_c(dir_output, fn_stem, '_stats.csv'))
+
+plt_data %>%
+  write_csv(str_c(dir_output, fn_stem, '_stats_data.csv'))
+
+result_df_combined %>%
+  filter(sig_symbol != 'n.s.') %>%
+  ggplot(aes(region_stim, region, label = sig_symbol)) +
+  geom_text()
+```
+
+
+
+### heat: region stim vs region recorded 20Hz
+```{r}
+region_levels <- key_regions %>% slice(n():1) %>% pull(region_label)
+
+fn_str <- 'region_vs_regionstim_matrix_20hz'
+
+plt_data <- streams_peth_summary_group %>%
+  mutate(region = factor(region, levels = rev(region_levels))) %>%
+  filter(trial_stim_frequency == 20) %>%
+  filter(!is.na(region_stim))
+
+plt_data %>%
+  ggplot(aes(region_stim, region, fill = !!as.name(var_iv))) +
+  geom_tile() +
+  scale_fill_gradientn(colors = c('blue', 'white', 'red'), limits = c(-3,3), oob = scales::squish) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5, 4.5), ylim = c(0.5,4.5), expand = F) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3),
+    axis.text.y = element_text(hjust = 1)
+  ) +
+  xlab('Stimulated') +
+  ylab('Recorded') +
+  force_panelsizes(cols = unit(3,'cm'), rows = unit(3, 'cm'))
+
+
+save_pdf(dir_output, str_c(fn_str, '.pdf'), 8,8)
+plt_data %>% write_csv(str_c(dir_output, fn_str, '.csv'))
+```
+
+### line: region vs zscore 20hz
+```{r}
+fn_stem <- 'line_region_vs_zscore_20hz'
+
+data_plt <- streams_peth_summary %>%
+  filter(trial_stim_frequency == 20) 
+
+plt01 <- data_plt %>%
+  filter(region_stim == 'NAcCR') %>%
+  ggplot(aes(region, delta_signal_poly_zscore_local)) +
+  geom_hline(yintercept = 0, color = 'grey', size = 0.5) +
+  geom_line(aes(group = subject), color = 'darkgrey', alpha = 1/3) +
+  geom_point(aes(group = subject), color = 'darkgrey', size = 1) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = 1)) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5, 4.5), ylim = c(-10,60), expand = F) +
+  scale_y_continuous(breaks = seq(-10,60,10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  xlab('') +
+  ggtitle('NAcCR')
+
+plt02 <- data_plt %>%
+  filter(region_stim == 'DMS') %>%
+  ggplot(aes(region, delta_signal_poly_zscore_local)) +
+  geom_hline(yintercept = 0, color = 'grey', size = 0.5) +
+  geom_line(aes(group = subject), color = 'darkgrey', alpha = 1/3) +
+  geom_point(aes(group = subject), color = 'darkgrey', size = 1) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = 1)) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5, 4.5), ylim = c(-2,6), expand = F) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  xlab('') +
+  ggtitle('DMS')
+
+plt03 <- data_plt %>%
+  filter(region_stim == 'DLS') %>%
+  ggplot(aes(region, delta_signal_poly_zscore_local)) +
+  geom_hline(yintercept = 0, color = 'grey', size = 0.5) +
+  geom_line(aes(group = subject), color = 'darkgrey', alpha = 1/3) +
+  geom_point(aes(group = subject), color = 'darkgrey', size = 1) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = 1)) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5, 4.5), ylim = c(-2,8), expand = F) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  xlab('') +
+  ggtitle('DLS')
+
+plt04 <- data_plt %>%
+  filter(region_stim == 'TS') %>%
+  ggplot(aes(region, delta_signal_poly_zscore_local)) +
+  geom_hline(yintercept = 0, color = 'grey', size = 0.5) +
+  geom_line(aes(group = subject), color = 'darkgrey', alpha = 1/3) +
+  geom_point(aes(group = subject), color = 'darkgrey', size = 1) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = 1)) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5, 4.5), ylim = c(-5,15), expand = F) +
+  scale_y_continuous(breaks = seq(-5,15,5)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  xlab('') +
+  ggtitle('TS')
+
+(plt01 + ylab('Mean z-score 0.0-0.5s')) +
+  (plt02 + ylab('')) +
+  (plt03 + ylab('') ) +
+  (plt04 + ylab('') ) +
+  plot_layout(nrow = 1, widths = unit(2, 'cm'), heights = unit(3, 'cm'))
+
+
+save_pdf(dir_output, str_c(fn_stem,'.pdf'),22,12)
+
+data_plt %>%
+  write_csv(str_c(dir_output, fn_stem, '_data.csv'))
+```
+
+```{r, fig.height = 8, fig.width = 4}
+# alternative visualization
+
+ data_plt %>%
+  ggplot(aes(region, delta_signal_poly_zscore_local)) +
+  geom_hline(yintercept = 0, color = 'grey', size = 0.5) +
+  geom_line(aes(group = subject), color = 'darkgrey', alpha = 1/3) +
+  geom_point(aes(group = subject), color = 'darkgrey', size = 1) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = 1)) +
+  theme_ag01() +
+  #coord_cartesian(xlim = c(0.5, 4.5), ylim = c(-10,60), expand = F) +
+  #scale_y_continuous(breaks = seq(-10,60,10)) +
+  facet_grid(region_stim~., scales = 'free') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  force_panelsizes(cols = unit(3,'cm'), rows = unit(3, 'cm')) 
+```
+
+#### statistics
+```{r}
+var_dv <- 'delta_signal_poly_zscore_local'
+id_region_stim <- 'NAcCR'
+
+plt_data <- streams_peth_summary %>%
+  filter(trial_stim_frequency == 20) 
+
+
+for(id_region_stim in key_regions$region_label){
+  
+  plt_data_wide <- plt_data %>%
+    filter(region_stim == id_region_stim) %>%
+    select(subject, region, !!as.name(var_dv)) %>%
+    spread(region, !!as.name(var_dv)) 
+  
+  result <- friedman.test(as.matrix(plt_data_wide[, -1]))
+  
+  result_df <- tidy(result) %>%
+    clean_names() %>%
+    mutate(region_stim = id_region_stim) %>%
+    select(region_stim, everything())
+  
+  # Convert data back to long format for post hoc test
+  plt_data_long <- plt_data_wide %>%
+    gather(key = "region", value = !!as.name(var_dv), -subject)
+  
+  # Conduct pairwise Wilcoxon signed-rank test as a post hoc test
+  post_hoc <- pairwise.wilcox.test(
+    x = plt_data_long %>% pull(var_dv),
+    g = plt_data_long$region,
+    p.adjust.method = "bonferroni"
+  )
+  
+  post_hoc_df <- post_hoc$p.value %>% 
+    as_tibble() %>%
+    mutate(comp1 = rownames(post_hoc$p.value)) %>%
+    gather('comp2', 'p_value', -comp1) %>%
+    filter(!is.na(p_value), comp1 != comp2) %>%
+    mutate(
+      region_stim = id_region_stim,
+      method = post_hoc$method,
+      method_pvaladj = post_hoc$p.adjust.method
+      ) %>%
+    select(region_stim, everything())
+  
+  if(id_region_stim == key_regions$region_label[1]){
+    result_df_combined <- result_df
+    post_hoc_df_combined <- post_hoc_df
+  } else {
+    result_df_combined <- result_df %>% bind_rows(result_df_combined,.)
+    post_hoc_df_combined <- post_hoc_df %>% bind_rows(post_hoc_df_combined,.)
+    
+  }
+}
+
+result_df_combined %>%
+  write_csv(str_c(dir_output, fn_stem, '_stats_main.csv'))
+
+post_hoc_df_combined %>%
+  quick_sig() %>%
+  write_csv(str_c(dir_output, fn_stem, '_stats_posthoc.csv'))
+  
+```
+
+
+```{r}
+post_hoc_df_combined %>%
+  mutate(region_stim = factor(region_stim, levels = key_regions$region_label)) %>%
+  mutate(comp1 = factor(comp1, levels = key_regions$region_label)) %>%
+  mutate(comp2 = factor(comp2, levels = key_regions$region_label)) %>%
+  quick_sig() %>%
+  ggplot(aes(comp1, comp2, label = sig_symbol)) +
+  geom_text() +
+  facet_grid(.~region_stim) +
+  force_panelsizes(cols = unit(3,'cm'), rows = unit(3, 'cm')) 
+```
+
+## placements
+```{r}
+log_histology <- read_sheet("https://docs.google.com/spreadsheets/d/1dATNdE46yfeKJmNBi51yeO8Iycv4RaMlfdc8xS4YBiY", sheet = 'placements', na = c('', 'NA'))
+```
+
+```{r}
+data_plt <- streams_peth_summary %>%
+  filter(trial_stim_frequency == 20)  %>%
+  left_join(log_histology %>% select(subject, region = target, hit_ap, hit_ml, hit_dv)) 
+```
+
+```{r, fig.width = 6, fig.height=8}
+
+
+plt_nac <- data_plt %>%
+  filter(region_stim == 'NAcCR') %>%
+  ggplot(aes(hit_ap, hit_dv, color = delta_signal_poly_zscore_local)) +
+  geom_point(size = 5, alpha = 1/2) +
+  facet_grid(region_stim~.) +
+  coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-2, -6)) +
+  scale_color_viridis_c(limits = c(0,20), oob = scales::squish) 
+
+plt_dms <- data_plt %>%
+  filter(region_stim == 'DMS') %>%
+  ggplot(aes(hit_ap, hit_dv, color = delta_signal_poly_zscore_local)) +
+  geom_point(size = 5, alpha = 1/2) +
+  facet_grid(region_stim~.) +
+  coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-2, -6)) +
+  scale_color_viridis_c(limits = c(0,4), oob = scales::squish) 
+
+plt_dls <- data_plt %>%
+  filter(region_stim == 'DLS') %>%
+  ggplot(aes(hit_ap, hit_dv, color = delta_signal_poly_zscore_local)) +
+  geom_point(size = 5, alpha = 1/2) +
+  facet_grid(region_stim~.) +
+  coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-2, -6)) +
+  scale_color_viridis_c(limits = c(0,6), oob = scales::squish) 
+
+plt_ts <- data_plt %>%
+  filter(region_stim == 'TS') %>%
+  ggplot(aes(hit_ap, hit_dv, color = delta_signal_poly_zscore_local)) +
+  geom_point(size = 5, alpha = 1/2) +
+  facet_grid(region_stim~.) +
+  coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-2, -6)) +
+  scale_color_viridis_c(limits = c(0,9), oob = scales::squish) 
+
+
+plt_nac + plt_dms + plt_dls + plt_ts +
+  plot_layout(ncol = 1, widths = unit(6, 'cm'), heights = unit(3, 'cm'))
+```
+
+
+```{r}
+
+plt_str <- function(df, var_color, var_color_name, vars_facet, color_limits, plt_plane, plt_dim_base){
+  range_ap <- c(-3, 3)
+  range_ml <- c(0, 4)
+  range_dv <- c(-6, -1)
+  
+  var_color <- rlang::enquo(var_color)
+  facet_formula <- as.formula(paste(vars_facet[1], '~', vars_facet[2]))
+  
+  if(plt_plane == 'sagittal'){
+    plt <- df %>%
+      ggplot(aes(hit_ap, hit_dv, color = !!var_color)) +
+      coord_cartesian(xlim = range_ap, ylim = range_dv, expand = F) +
+      xlab('Anterior-posterior (mm)')+
+      ylab('Dorsal-ventral (mm)') 
+  }
+  
+  if(plt_plane == 'coronal'){
+    plt <- df %>%
+      ggplot(aes(hit_ml, hit_dv, color = !!var_color)) +
+      coord_cartesian(xlim = range_ml, ylim = range_dv, expand = F) +
+      xlab('Medial-lateral (mm)')+
+      ylab('Dorsal-ventral (mm)')
+  }
+  
+  if(plt_plane == 'horizontal'){
+    plt <- df %>%
+      ggplot(aes(hit_ap, hit_ml, color = !!var_color)) +
+      coord_cartesian(xlim =  range_ap, ylim = range_ml, expand = F) +
+      xlab('Anterior-posterior (mm)')+
+      ylab('Medial-lateral (mm)') 
+  }
+  
+  plt <- plt +
+    geom_point(size = 2, alpha = 1)
+  
+  if(sum(is.na(color_limits)) == 0){
+    plt <- plt +
+      scale_color_viridis_c(
+        limits = color_limits,
+        oob = scales::squish,
+        name = var_color_name, 
+        breaks = color_limits)
+  }
+  
+   plt <- plt+
+    theme_ag01() +
+    theme(
+      legend.key.size = unit(0.5, "cm"),
+      legend.key.width = unit(0.2,"cm"),
+      legend.title.position = "right",
+      panel.grid.major = element_line(color = 'lightgrey', size = 0.5), 
+      legend.title = element_text(angle = 270, hjust = 0.5),
+      axis.title = element_text(color = "black", size = 10),
+      axis.text.x = element_text(color = "black", size = 8, hjust = 0.5),
+      axis.text.y = element_text(color = "black", size = 8, hjust = 1, vjust = 0.3, margin = margin(r = 1)),
+
+    ) 
+  
+  
+  plt <- plt +
+    facet_grid(facet_formula)
+  
+  dim_ap <- range_ap[2] - range_ap[1]
+  dim_ml <- range_ml[2] - range_ml[1]
+  dim_dv <- range_dv[2] - range_dv[1]
+  
+  
+  aspect_sagital <- dim_ap / dim_dv
+  aspect_coronal <- dim_ml / dim_dv
+  aspect_horizontal <- dim_ap / dim_ml
+  
+  if(plt_plane == 'sagittal'){
+    plt <- plt +
+      force_panelsizes(rows = unit(plt_dim_base, 'cm'), cols = unit(plt_dim_base*aspect_sagital, 'cm'))
+  } 
+    
+  if(plt_plane == 'horizontal'){
+    plt <- plt +
+      force_panelsizes(rows = unit(plt_dim_base, 'cm'), cols = unit(plt_dim_base*aspect_horizontal, 'cm'))
+  } 
+  
+  if(plt_plane == 'coronal'){
+    plt <- plt +
+      force_panelsizes(rows = unit(plt_dim_base, 'cm'), cols = unit(plt_dim_base*aspect_coronal, 'cm'))
+  }
+  
+  return(plt)
+  
+}
+
+
+
+plt_str_3d <- function(df, var_color, color_limits, dir_output, fn_stem, toggle_save){
+  x_range <- c(-3, 3)
+  y_range <- c(0, 4)
+  z_range <- c(-5, -2)
+  
+  font.pref.title <- list(size=30, family="Arial, sans-serif", color="black")
+  font.pref.tick <- list(size=18, family="Arial, sans-serif", color="black")
+  
+  i <- -2.5 # x/y eye position
+  ii <- 0.5 # z eye position
+  
+  # Convert the column name to a symbol
+  var_color_sym <- sym(var_color)
+  
+  # Squish the values of var_color within the specified color_limits
+  df <- df %>%
+    mutate(!!var_color_sym := ifelse(!!var_color_sym > color_limits[2], color_limits[2], !!var_color_sym)) %>%
+    mutate(!!var_color_sym := ifelse(!!var_color_sym < color_limits[1], color_limits[1], !!var_color_sym))
+  
+  # Create the plot
+  plt <- plot_ly(df,
+          x = ~hit_ap, 
+          y = ~hit_ml, 
+          z = ~hit_dv, 
+          color = ~.data[[var_color]],  # Use the symbol for the color mapping
+          type = 'scatter3d', 
+          mode = 'markers',  # Plot points only
+          marker = list(
+            size = 10,
+            colorscale = 'Viridis',  
+            cmin = color_limits[1],   # Set the minimum value for color scaling
+            cmax = color_limits[2]    # Set the maximum value for color scaling
+          )
+  ) %>%
+    layout(scene = list(
+             xaxis = list(
+               title = 'AP (mm)', 
+               range = x_range, 
+               tickvals = seq(x_range[1], x_range[2], by = 1),  # Specify x-axis ticks
+               ticktext = seq(x_range[1], x_range[2], by = 1),  # Custom labels
+               nticks = sum(abs(x_range)), 
+               titlefont = font.pref.title,
+               tickfont = font.pref.tick,
+               zeroline = FALSE,  # Remove emphasis on zero line
+               showline = TRUE,   # Keep the axis line visible
+               showgrid = TRUE    # Optionally keep grid lines
+             ),
+             yaxis = list(
+               title = 'ML (mm)', 
+               range = y_range, 
+               tickvals = seq(y_range[1], y_range[2]-1, by = 1),  # Specify y-axis ticks
+               ticktext = seq(y_range[1], y_range[2]-1, by = 1),  # Custom labels
+               nticks = sum(abs(y_range)), 
+               titlefont = font.pref.title,
+               tickfont = font.pref.tick,
+               zeroline = FALSE,  # Remove emphasis on zero line
+               showline = TRUE,  
+               showgrid = TRUE   
+             ),
+             zaxis = list(
+               title = 'DV (mm)', 
+               range = z_range, 
+               tickvals = seq(z_range[1]+1, z_range[2], by = 1),  # Specify z-axis ticks
+               ticktext = seq(z_range[1]+1, z_range[2], by = 1),  # Custom labels
+               nticks = 6, 
+               titlefont = font.pref.title,
+               tickfont = font.pref.tick,
+               zeroline = FALSE,  # Remove emphasis on zero line
+               showline = TRUE,  
+               showgrid = TRUE   
+             ), 
+              aspectmode = 'manual',
+              aspectratio = list(
+                x = (x_range[2] - x_range[1])/4.5, 
+                y = (y_range[2] - y_range[1])/4.5, 
+                z = (z_range[2] - z_range[1])/4.5
+              ),
+             camera = list(
+               eye = list(x = cos(i)*3, y = sin(i)*3, z = ii*3), 
+               center = list(x = 0, y = 0, z = -0.1)
+             )
+           )
+    )
+  
+  if(toggle_save){
+    save_image(plt,
+               width = 900,
+               height = 800,
+               scale = 1,
+               str_c(dir_output, fn_stem, ".pdf"))
+  } else {
+    plt
+  }
+}
+
+
+
+
+### ~ execution ~ ###
+
+fn_stem <- 'placement_vs_optoresponse'
+
+for(region_id in key_regions$region_label){
+  df <- data_plt %>% filter(region_stim == region_id)
+  
+  if(region_id == 'NAcCR'){ color_limits <- c(0,20)}
+  if(region_id == 'DMS'){color_limits <- c(0,4)}
+  if(region_id == 'DLS'){color_limits <- c(0,6)}
+  if(region_id == 'TS'){color_limits <- c(0,9)}
+  
+  # plt_str(
+  #   df = df, 
+  #   var_color = delta_signal_poly_zscore_local,
+  #   var_color_name = 'z-score',
+  #   vars_facet = c('.','.'),
+  #   plt_plane = 'sagittal',
+  #   plt_dim_base = 3,
+  #   color_limits = color_limits
+  #   ) 
+  # 
+  # save_pdf(dir_output, str_c(fn_stem,'_', region_id, '_sagittal.pdf'),6,6)
+  # 
+  # plt_str(
+  #   df = df,
+  #   var_color = delta_signal_poly_zscore_local,
+  #   var_color_name = 'z-score',
+  #   vars_facet = c('.','.'),
+  #   plt_plane = 'horizontal',
+  #   plt_dim_base = 3,
+  #   color_limits = color_limits
+  #   ) 
+  # 
+  # save_pdf(dir_output, str_c(fn_stem,'_', region_id, '_horizontal.pdf'),6,6)
+  # 
+  # plt_str(
+  #   df = df,
+  #   var_color = delta_signal_poly_zscore_local,
+  #   var_color_name = 'z-score',
+  #   vars_facet = c('.','.'),
+  #   plt_plane = 'coronal',
+  #   plt_dim_base = 3,
+  #   color_limits = color_limits
+  #   )
+  # 
+  # save_pdf(dir_output, str_c(fn_stem,'_', region_id, '_coronal.pdf'),6,6)
+    
+  plt_str_3d(
+    df = df, 
+    var_color = 'delta_signal_poly_zscore_local', 
+    color_limits = color_limits,
+    dir_output = dir_output,
+    fn_stem = str_c(fn_stem,'_', region_id, '_3d'),
+    toggle_save = 1
+    )
+}
+
+df %>%
+  write_csv(str_c(dir_output, 'placement_vs_optoresponse_data.csv' ))
+```
+
+
+

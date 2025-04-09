@@ -1,0 +1,3739 @@
+---
+title: "compiler"
+author: "adam gordon-fennell"
+date: '2023-12-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# setup
+## libraries
+```{r}
+library(tidyverse)
+library(afex)
+library(emmeans)
+library(janitor)
+library(readxl)
+library(googlesheets4)
+library(ggh4x) # force_panelsizes
+library(arrow)
+library(zoo)
+library(lubridate)
+library(patchwork)
+library(ggbeeswarm)
+library(ggpubr) #r2 on correlation
+library(pals)
+library(boot) #bootstrapping
+library(corrplot)
+library(Hmisc)
+library(plotly)
+
+arrow::set_cpu_count(4)
+
+source('./functions/r_head_fixed_processing.R')
+source('./functions/r_general.R')
+source('./functions/r_plots.R')
+source('./functions/r_stats.R')
+source('./functions/general.R')
+source('./functions/pca.R')
+source('./functions/plotting_placements.R')
+source('./functions/analysis_peth.R')
+
+writeLines(capture.output(sessionInfo()), "./analysis_output/session_info_r.txt")
+
+library(viridisLite)
+
+color_values_nacl <- inferno(5, begin = 0, end = 0.8)
+color_values_suc <- mako(5, begin = 0, end = 0.8)
+color_values_misc01 <-  c('black', 'grey', '#BCD634', '#34BCD6')
+color_values_misc02 <-  c('black', '#D634BC', '#BCD634', '#34BCD6')
+color_values_groupcombined <- c('darkgrey', '#CC2029', '#70BF46')
+color_values_regions <- c('#72BF45', '#CD202A', '#7B8137', '#000004FF', '#2A115CFF', '#6C1D81FF', '#AD347CFF', '#EA5661FF', '#FE9F6DFF')
+color_values_regions_da <- c('#000004FF', '#2A115CFF', '#6C1D81FF', '#AD347CFF', '#EA5661FF', '#FE9F6DFF')
+color_values_regions_da7 <- c("#000004FF", "#20114BFF", "#57157EFF", "#8C2981FF", "#C43C75FF", "#F1605DFF", "#FE9F6DFF")
+color_values_experiment_set <- c('#7edb00', '#007edb', '#db007e')
+```
+
+
+
+## directories
+```{r}
+dir_output <- './data/combined_setid/'
+
+dir_localdata_sessions <- './data/sessions/' #end with "/"
+dir_sessions_combined_subject <- './data/sessions_combined_subject/'
+```
+
+
+## logs / keys
+```{r}
+log_analysis_subjects <- read_xlsx('./log_data_analysis.xlsx', sheet = 'subjects',    na = c('NA', ''))
+log_subjects <- read_xlsx('log_data_analysis.xlsx', sheet = 'subjects') 
+log_analysis_fp <- read_xlsx('./log_data_analysis.xlsx', sheet = 'fp',          na = c('NA', ''))
+log_analysis_exp <- read_xlsx('./log_data_analysis.xlsx', sheet = 'experiments', na = c('NA', ''))
+log_npm <- read_sheet('https://docs.google.com/spreadsheets/d/1v-G8GHYPGtJWXARZYqcndO03d23umsTo98BAb5_WnrY/edit#gid=0', na = c('', 'NA'))
+log_placements <- read_sheet('https://docs.google.com/spreadsheets/d/1dATNdE46yfeKJmNBi51yeO8Iycv4RaMlfdc8xS4YBiY', sheet = 'placements', na = c('na','NA',''))
+```
+
+
+```{r}
+join_info <- log_analysis_fp %>% 
+  get_set_id() %>% 
+  select(blockname, experiment, subject, set_id)
+```
+
+
+```{r}
+region_ids <- c(
+  'nac', 
+  'nac_corr',
+  'nac_shelllat',
+  'nacsh_lat',
+  'nacsh_med',
+  'dms',
+  'dls',
+  'ts', 
+  'lha_gaba',
+  'lha_glut', 
+  'lha_ratio'
+)
+
+
+signal_ids <- c(
+  'zscore',
+  'zscoreblsub'
+)
+```
+
+# functions
+```{r}
+key_regions <- tibble(
+  region =       c('lha_gaba', 'lha_glut', 'lha_ratio', 'nac',   'nac_corr', 'nacsh_med', 'nac_shelllat', 'nacsh_lat',  'dms', 'dls', 'ts'),
+  region_label = c('LHA:GABA', 'LHA:Glut', 'LHA:Ratio', 'NAcCR', 'NAcCC',    'NAcShM',    'NAcShL',       'NAcShL',     'DMS', 'DLS', 'TS')
+)
+
+key_solutions <- tibble(
+  solution =       c('sucrose00', 'sucrose05', 'sucrose10', 'sucrose20',   'sucrose30', 'nacl000', 'nacl025', 'nacl050',  'nacl100', 'nacl150'),
+  solution_label = c('0',         '5',         '10',        '20',          '30',        '0.00',    '0.25',    '0.50',     '1.00',    '1.50'),
+  solution_set   = c('sucrose',   'sucrose',   'sucrose',   'sucrose',     'sucrose',   'nacl',    'nacl',    'nacl',     'nacl',    'nacl')
+)
+
+format_solutions <- function(df, key_regions){
+  df %>%
+    ungroup() %>%
+    left_join(key_solutions) %>%
+    mutate(solution_label = factor(solution_label, levels = key_solutions$solution_label %>% unique())) %>%
+    select(-solution) %>%
+    rename(solution = solution_label) %>%
+    select(solution, everything())
+}
+
+key_set_id <- tibble(
+  set_id =       c('wrsuc', 'frsuc', 'wrnacl'),
+  set_id_label = c('WR:Suc','FR:Suc','WR:NaCl')
+)
+
+format_pc <- function(df){
+  df %>%
+    mutate(pc_id = case_when(
+         pc_id == 'pc1' ~ 'PC1',
+         pc_id == 'pc2' ~ 'PC2',
+         pc_id == 'pc3' ~ 'PC3',
+         pc_id == 'da_mean' ~ 'Mean DA'
+  )
+  )
+}
+
+
+join_solution_x <- tibble(
+  solution = c('sucrose00', 'sucrose05', 'sucrose10', 'sucrose20', 'sucrose30', 'nacl000', 'nacl025', 'nacl050', 'nacl100', 'nacl150'),
+  plt_x =    c(           1,           2,           3,           4,           5,        5,         4,         3,         2,        1),
+  plt_f =    c(           1,           1,           1,           1,           1,        2,         2,         2,         2,        2)
+)
+
+format_group_combined <- function(df){
+  df %>%
+    mutate(group_combined = case_when(
+      group_combined == 'control' ~ 'Control',
+      group_combined == 'vgat_stim' ~ 'LHA GABA',
+      group_combined == 'vglut2_stim' ~ 'LHA Glut'
+    ))
+}
+```
+
+
+
+```{r}
+combine_session_files <- function(process_blocknames, dir_localdata_sessions, fn_suffix){
+  
+  for(process_blockname in process_blocknames){
+    dir_session_process <- str_c(dir_localdata_sessions, process_blockname, '/')
+    
+    # read in behavior data
+    if(fn_suffix %>% str_detect('.csv')){
+      df <- read.csv(str_c(dir_session_process, process_blockname, fn_suffix)) 
+    } else if(fn_suffix %>% str_detect('.feather')){
+      df <- read_feather(str_c(dir_session_process, process_blockname, fn_suffix)) 
+    }
+    
+    if(process_blockname == process_blocknames[1]){ # if first loop
+      df_combined <- df
+    } else {
+      df_combined <- df %>% bind_rows(df_combined,.)
+    }
+  }
+  
+  return(df_combined)
+}
+
+
+
+combine_session_fp <- function(process_blocknames, dir_localdata_sessions){
+  
+  for(process_blockname in process_blocknames){
+    dir_session_process <- str_c(dir_localdata_sessions, process_blockname, '/')
+    
+    ## read in fp data
+    df <- read_feather(str_c(dir_session_process, process_blockname, '_streams_peth_preprocessed.feather')) %>%
+      filter(event_id_char %in% c('access_period', 'spout_extended')) %>%
+      rename(trial_num = event_number) %>%
+      select(any_of(c("blockname", "region", "trial_num", "time_rel", "time", "signal", "delta_signal_poly", "zscore", "zscore_blsub")))
+  
+    df_trial_info <- read.csv(str_c(dir_session_process, process_blockname, '_data_trial_summary.csv')) %>%
+      select(blockname, trial_num, spout, solution, trial_lick, lick_count, lick_ts_first, lick_ts_last) %>%
+      mutate(solution_previous = lag(solution))
+  
+    df <- df %>%
+      left_join(df_trial_info, by = join_by(blockname, trial_num))
+    
+    if(process_blockname == process_blocknames[1]){ # if first loop
+      df_combined <- df
+    } else {
+      df_combined <- df %>% bind_rows(df_combined,.)
+    }
+  }
+  
+  return(df_combined)
+}
+
+
+get_mean_signals <- function(df){
+  df %>%
+    summarise(
+      delta_signal_poly_sem = sd(delta_signal_poly)/sqrt(n()),
+      delta_signal_poly_mean = delta_signal_poly %>% mean(),
+      zscore_sem = sd(zscore)/sqrt(n()),
+      zscore_mean = zscore %>% mean(),
+      zscore_blsub_sem = sd(zscore_blsub)/sqrt(n()),
+      zscore_blsub_mean = zscore_blsub %>% mean(), 
+      sample_count = n(),
+      .groups = 'drop'
+    )
+}
+
+
+get_peth_binned_summary <- function(df_peth, peth_tm_bins, grouping_vars){
+  
+  # for each bin defined in peth_tm_bins
+  for(bin_id in seq(1,nrow(peth_tm_bins))){
+  
+    peth_tm_bin <- peth_tm_bins[bin_id,] # get tm_bin info for loop
+    
+    # filter time_rel to tm_bins, define time_bin,  summarise and combine
+    if(bin_id == 1){
+      
+      df_fp_peth_summary <- df_peth %>%
+        filter(time_rel > peth_tm_bin$tm_bin_start, time_rel < peth_tm_bin$tm_bin_end) %>%
+        mutate(time_bin = peth_tm_bin$tm_bin_id) %>%
+        group_by(across(all_of(grouping_vars))) %>%
+        get_mean_signals()
+      
+    } else {
+      df_fp_peth_summary <- df_peth %>%
+        filter(time_rel > peth_tm_bin$tm_bin_start, time_rel < peth_tm_bin$tm_bin_end) %>%
+        mutate(time_bin = peth_tm_bin$tm_bin_id) %>%
+        group_by(across(all_of(grouping_vars))) %>%
+        get_mean_signals() %>%
+        bind_rows(df_fp_peth_summary,.)
+    }
+  }
+  
+  # compute mean signal at baseline of subsequent trial
+  if(sum('solution' %in% grouping_vars)){
+    grouping_vars_previous <- grouping_vars
+    grouping_vars_previous[grouping_vars_previous=='solution'] <- 'solution_previous'
+    
+    
+    if(sum('solution_previous' %in% names(df_fp_peth)) == 1){
+      df_fp_peth_summary <- df_peth %>%
+        filter(time_rel > -3, time_rel < 0) %>%
+        mutate(time_bin = 'baseline_subsequent') %>%
+        group_by(across(all_of(grouping_vars_previous))) %>%
+        get_mean_signals() %>%
+        rename(solution = solution_previous) %>%
+        filter(!is.na(solution)) %>%
+        bind_rows(df_fp_peth_summary,.)
+    }
+  }
+  
+  
+  
+  
+  return(df_fp_peth_summary)
+}
+
+
+
+```
+
+
+
+
+
+## kinetics
+```{r}
+get_kinetics <- function(df, var_dv, rise_time_tresh){
+  # df should be streams_peth_solution that contains blockname, region, trial_num, deprivation, and 'var_dv'
+  
+  # compute derivative of var_dv for each trial
+  df_derivative <- df %>%
+    group_by(blockname, region, trial_num) %>%
+    mutate(derivative = !!as.name(var_dv) - lag(!!as.name(var_dv)))  %>%
+    ungroup()
+  
+  # obtain the mean derivative trace
+  df_derivative_trace_mean <- df_derivative %>%
+    group_by(region, solution, time_rel) %>%
+    summarise(
+      derivative_sem = sd(derivative)/sqrt(n()),
+      derivative_mean = derivative %>% mean(),
+      .groups = 'drop'
+    )
+  
+  # obtain the max deriavative and time of max derivative for each trial
+  df_derivative_max <- df_derivative %>%
+    filter(time_rel > 0, time_rel < 3) %>%
+    group_by(blockname, subject, region, trial_num) %>%
+    filter(derivative == max(derivative, na.rm= TRUE)) %>% # get max derivative for each trial
+    ungroup() %>%
+    select(blockname, subject, region, solution, trial_num, derivative, time_rel) %>%
+    rename(derivative_max = derivative, derivative_max_time = time_rel)
+  
+  # obtain time signal passes rise_time_thresh for each trial
+  df_time_rise <- df %>%
+    filter(time_rel > 0, time_rel < 3) %>%
+    group_by(blockname, subject, region, trial_num) %>%
+    filter(!!as.name(var_dv) > rise_time_tresh) %>%           # filter to signal < threshold
+    filter(time_rel == min(time_rel)) %>%                            # filter to minimum time
+    ungroup() %>%
+    select(blockname, subject, region, solution, trial_num, time_rel) %>%     #
+    rename(time_rise = time_rel)
+  
+  
+  # combine trial summaries
+  df_kinetic_summary_trial <- df_derivative_max %>%
+    full_join(df_time_rise, by = join_by(blockname, subject, region, solution, trial_num))
+  
+  # compute subject summaries
+  df_kinetic_summary_subject_region_solution <- df_kinetic_summary_trial %>%
+    group_by(subject, region, solution) %>%
+    summarise(
+      derivative_max_mean = derivative_max %>% mean(na.rm = T),
+      derivative_max_time_mean = derivative_max_time %>% mean(na.rm = T),
+      time_rise_mean = time_rise %>% mean(na.rm = T),
+      .groups = 'drop'
+    )
+  
+  return(list(df_derivative_trace_mean, df_kinetic_summary_trial, df_kinetic_summary_subject_region_solution))
+}
+
+
+plt_line_pairwise <- function(df, dir_output, fn_stem, var_id = 'subject', var_dv, var_within, ylims, heat_range = NA){
+  
+  n_within <- df %>%
+    pull(!!as.name(var_within)) %>% 
+    unique() %>%
+    length()
+  
+  pltline <- df %>%
+    
+    ggplot(aes(region, !!as.name(var_dv))) +
+    geom_line(aes(group = !!as.name(var_id)), alpha = 1/4) +
+    stat_summary(fun = 'mean', geom = 'line', aes(group = 1)) +
+    stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = 1), width = 0) +
+    theme_ag01() +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+    coord_cartesian(xlim = c(0.5, n_within + 0.5), ylim = ylims, expand = F)
+  
+  
+  stats_results <- df %>%
+    aov_rm_one_within(dir_output,fn_stem,var_id, var_dv, var_within)
+  
+  
+  df_pairs <- stats_results[[3]] %>%
+    format_regions('contrast1_within', key_regions) %>%
+    format_regions('contrast2_within', key_regions) 
+  
+  
+  plt_comparisions <- plt_hsd_matrix_2contrasts(df_pairs, heat_range) 
+  
+  
+  pltline + plt_comparisions +
+    plot_layout(nrow = 1, widths = unit(4,'cm'), heights = unit(4, 'cm'))
+  
+  save_pdf(dir_output, str_c(fn_stem, '_plt_line_pairwise.pdf'), 10, 5)
+  
+  return(list(stats_results, pltline, plt_comparisions))
+}
+
+
+
+plt_summary_kinetics <- function(plt_data_kinetics, fn_stem_set){
+  dir_output_subplots <- str_c(dir_output, fn_stem_set, '/')
+  
+  if(!dir.exists(dir_output_subplots)){
+    dir.create(dir_output_subplots)
+  }
+  
+  kientics_region_vs_derivativemax <- 
+    plt_line_pairwise(
+      df = plt_data_kinetics, 
+      dir_output = dir_output_subplots,
+      fn_stem = str_c(fn_stem_set, '_region_vs_derivativemax'),
+      var_dv = 'derivative_max_mean',
+      var_within = 'region' ,
+      ylims = c(0,2.5)
+    )
+  
+  kientics_region_vs_derivativemaxtime <- 
+    plt_line_pairwise(
+      df = plt_data_kinetics, 
+      dir_output = dir_output_subplots,
+      fn_stem = str_c(fn_stem_set, 'region_vs_derivativemaxtime'),
+      var_dv = 'derivative_max_time_mean',
+      var_within = 'region' ,
+      ylims = c(0,2.5)
+    )
+  
+  kientics_region_vs_timerise <- 
+    plt_line_pairwise(
+      df = plt_data_kinetics, 
+      dir_output = dir_output_subplots,
+      fn_stem = str_c(fn_stem_set, 'region_vs_timerise'),
+      var_dv = 'time_rise_mean',
+      var_within = 'region' ,
+      ylims = c(0,1)
+    )
+  
+  
+  kientics_region_vs_derivativemax[[2]] + kientics_region_vs_derivativemax[[3]] +
+    kientics_region_vs_derivativemaxtime[[2]] + kientics_region_vs_derivativemaxtime[[3]] +
+    kientics_region_vs_timerise[[2]] + kientics_region_vs_timerise[[3]] +
+    plot_layout(ncol = 2, widths = unit(4, 'cm'), heights = unit(4, 'cm')) +
+    plot_annotation(
+      title = str_c('summary - ', fn_stem_set)
+    )
+  
+  
+  save_pdf(dir_output, str_c(fn_stem_set, '_summary_figure.pdf'), 9, 9)
+}
+```
+
+
+
+## correlation
+```{r}
+tidy_cor_output_reshape <- function(df, n_table, var_name){
+  df_tidy <- df[[n_table]] %>%
+    as_tibble()
+  
+  df_tidy <- df_tidy %>%
+    mutate(var_y = colnames(df_tidy)) %>%
+    gather('var_x', !!as.name(var_name), -var_y) 
+  
+
+  
+  return(df_tidy)
+}
+
+tidy_cor_output <- function(df){
+  tidy_cor_output_reshape(df, 1, 'r') %>%
+    left_join(tidy_cor_output_reshape(df, 2, 'n'), by = c("var_y", "var_x")) %>%
+    left_join(tidy_cor_output_reshape(df, 3, 'p'), by = c("var_y", "var_x"))
+}
+
+
+get_cormatrix <- function(df){
+  df_corr = rcorr(as.matrix(df))
+  tidy_cor_output(df_corr)
+}
+
+tidy_cormatrix <- function(df, var_cors, var_groups = NA){
+  require(Hmisc)
+  
+  df <- df %>%
+    ungroup()
+
+
+  if(sum(is.na(var_groups)) > 0){
+    df <- df %>% select(var_cors)
+  
+    df %>%
+      group_modify(~ get_cormatrix(.))
+    
+  } else {
+    df <- df %>% select(var_cors, var_groups)
+    
+    df %>%
+      group_by_at(var_groups) %>%
+      group_modify(~ get_cormatrix(.))
+    
+  }
+}
+
+plt_corrmatrix <- function(df){
+  df %>%
+    ggplot(aes(var_x, var_y, fill = r)) +
+    geom_tile() +
+    scale_fill_gradientn(colors = c('blue', 'white', 'red'), limits = c(-1,1), oob = scales::squish) +
+    theme_ag01() +
+    theme(
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)
+    ) 
+}
+```
+
+
+# analysis / plotting
+## summarise data 
+### set_id
+```{r}
+
+subjects <- read_xlsx('log_data_analysis.xlsx', sheet = 'subjects') %>%
+  filter(inclusion_consumption == 1) %>%
+  #filter(experiment == 'aaw') %>%
+  pull(subject)
+
+log_data <- read_xlsx('log_data_analysis.xlsx', sheet = 'fp') %>%
+  filter(exclude != 1) %>%
+  filter(subject %in% subjects) %>%
+  get_set_id() %>%
+  filter(!is.na(set_id))
+
+
+# loop over peth_parameters in log_data_analysis.xlsx from here ------
+loop_set_ids <- log_data$set_id %>% unique()
+#loop_set_ids <- c('frsuc', 'wrsuc', 'wrnacl') # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~udpate
+
+
+# ---- params
+peth_filt_fulltrace <- c(-3, 8) # time_rel included in output
+
+peth_tm_bins <- tibble(
+  tm_bin_id =    c('access', 'prelick', 'initial', 'sustained', 'post'),
+  tm_bin_start = c(       0,         0,         0,           2,      6),
+  tm_bin_end   = c(       3,       0.3,         1,           3,      8)
+)
+
+dir_output <- './data/combined_setid/'
+
+fns_qc_metrics <- list.files(dir_localdata_sessions, pattern = 'quality_metrics.csv', recursive = T, full.names = T)
+combined_qc_metrics <- bind_rows(lapply(fns_qc_metrics, read.csv))
+
+subjects_to_remove <- log_analysis_subjects %>%
+  filter(remove == 1) %>%
+  pull(subject)
+
+for(loop_set_id in loop_set_ids){
+  print(str_c('processing set_id:', loop_set_id))
+  
+  # setup import blocknames
+  process_blocknames <- log_data %>%
+    filter(set_id %in% loop_set_id) %>%
+    pull(blockname)
+
+# import peth and join in subject id
+  df_fp_peth <- combine_session_fp(process_blocknames, dir_localdata_sessions) %>%
+    left_join(log_analysis_fp %>% select(blockname, subject), by = 'blockname') 
+  
+  # exclude subjects defined in log_analysis_subjects
+  df_fp_peth <- df_fp_peth %>%
+    filter(!subject %in% subjects_to_remove) 
+   
+  # exclude fibers with poor quality
+  df_fp_peth <- df_fp_peth %>%
+    left_join(combined_qc_metrics %>% select(blockname, region, exclude_poor_signal), by = c('blockname', 'region')) %>%
+    filter(exclude_poor_signal == 0 | is.na(exclude_poor_signal)) %>% # is.na for lha ratio
+    select(-exclude_poor_signal)
+  
+  # filter fibers based on log_placements
+  df_fp_peth <- df_fp_peth %>%
+    format_regions('region',key_regions) %>%
+    filter_placements('exclude_da_consumption') # filter fibers
+  
+  # filter time_rel
+  df_fp_peth <- df_fp_peth %>% 
+    filter(time_rel > peth_filt_fulltrace[1], time_rel < peth_filt_fulltrace[2])
+  
+  # process full dataset and only trials with licks 
+  for(toggle_filt_trial_lick in  c(0,1)){ 
+    
+    if(toggle_filt_trial_lick == 1){
+      df_fp_peth <- df_fp_peth %>%
+        filter(trial_lick == 1)
+      fn_prefix <- 'filtlick'
+    } else {
+      fn_prefix <- 'full'
+    }
+    
+    fn_prefix <- str_c(loop_set_id, '_', fn_prefix)
+    
+    
+    # fp trace - overall
+    df_fp_peth_summary_trace_overall <- df_fp_peth %>%
+      left_join(join_info) %>%
+      group_by(set_id, region, solution, time_rel) %>%
+      get_mean_signals() 
+    
+    df_fp_peth_summary_trace_overall %>%
+      write_csv(str_c(dir_output, fn_prefix, '_', 'peth_summary_trace_overall.csv'))
+    
+    
+    # fp trace - trial lick
+    if(toggle_filt_trial_lick == 0){
+      df_fp_peth_summary_trace_overall <- df_fp_peth %>%
+        left_join(join_info) %>%
+        group_by(set_id, region, trial_lick, time_rel) %>%
+        get_mean_signals() 
+      
+      df_fp_peth_summary_trace_overall %>%
+        write_csv(str_c(dir_output, fn_prefix, '_', 'peth_summary_trace_triallick.csv'))
+    }
+    
+    # fp trace - grouped by subject
+    df_fp_peth_summary_trace_subject <- df_fp_peth %>%
+      left_join(join_info) %>%
+      group_by(experiment, subject, set_id, region, solution, time_rel) %>%
+      get_mean_signals()
+    
+    df_fp_peth_summary_trace_subject %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_trace_subject.csv'))
+    
+    # fp trace - grouped by binned trial
+    df_fp_peth_summary_trace_binnedtrial <- df_fp_peth %>%
+      left_join(join_info) %>%
+      mutate(bin_trial = cut(trial_num, seq(0,100, 10), labels = sprintf("%02d", seq(0,90,10)))) %>%
+      mutate(bin_trial = bin_trial %>% as.character()) %>%
+      group_by(set_id, region, solution, bin_trial, time_rel) %>%
+      get_mean_signals()
+    
+    df_fp_peth_summary_trace_binnedtrial %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_trace_binnedtrial.csv'))
+    
+    # fp summary - subject
+    grouping_vars <- c('experiment', 'subject', 'set_id', 'region', 'solution', 'time_bin')
+    
+    df_fp_peth_summary_means_subject <- df_fp_peth %>%
+      select(-subject) %>%
+      left_join(join_info, by = join_by(blockname)) %>%
+      get_peth_binned_summary(peth_tm_bins, grouping_vars)
+    
+    df_fp_peth_summary_means_subject %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_subject.csv'))
+    
+    # fp summary - subject - trial lick
+    if(toggle_filt_trial_lick == 0){
+      grouping_vars <- c('experiment', 'subject', 'set_id', 'region', 'trial_lick', 'time_bin')
+      
+      df_fp_peth_summary_means_subject_triallick <- df_fp_peth %>%
+        select(-subject) %>%
+        left_join(join_info, by = join_by(blockname)) %>%
+        get_peth_binned_summary(peth_tm_bins, grouping_vars) 
+      
+    df_fp_peth_summary_means_subject_triallick %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_subject_triallick.csv'))
+    }
+    
+    
+    
+    # fp summary - trial
+    grouping_vars <- c('experiment', 'blockname', 'subject', 'set_id', 'region', 'trial_num', 'solution', 'time_bin', 'lick_count', 'lick_ts_first', 'lick_ts_last')
+    
+    df_fp_peth_summary_means_trial <- df_fp_peth %>%
+      left_join(join_info) %>%
+      get_peth_binned_summary(peth_tm_bins, grouping_vars)
+    
+    df_fp_peth_summary_means_trial %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_trial.csv'))
+    
+    
+    # fp summary - trial - trial lick
+    if(toggle_filt_trial_lick == 0){
+      grouping_vars <- c('experiment', 'blockname', 'subject', 'set_id', 'region', 'trial_num', 'trial_lick', 'time_bin', 'lick_count', 'lick_ts_first', 'lick_ts_last')
+      
+      df_fp_peth_summary_means_trial_triallick <- df_fp_peth %>%
+        left_join(join_info) %>%
+        get_peth_binned_summary(peth_tm_bins, grouping_vars)
+      
+      df_fp_peth_summary_means_trial_triallick %>%
+        write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_trial_triallick.csv'))
+    }
+    
+    
+    # fp summary - binned trial
+    grouping_vars <- c('experiment', 'blockname', 'subject', 'set_id', 'region', 'bin_trial', 'solution', 'time_bin')
+    
+    df_fp_peth_summary_means_binnedtrials <- df_fp_peth %>%
+      left_join(join_info) %>%
+      mutate(bin_trial = cut(trial_num, seq(0,100, 10), labels = sprintf("%02d", seq(0,90,10)))) %>%
+      mutate(bin_trial = bin_trial %>% as.character()) %>%
+      get_peth_binned_summary(peth_tm_bins, grouping_vars)
+    
+    df_fp_peth_summary_means_binnedtrials %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_binnedtrial.csv'))
+    
+    # fp summary - binned trial
+    if(toggle_filt_trial_lick == 0){
+      grouping_vars <- c('experiment', 'blockname', 'subject', 'set_id', 'region', 'bin_trial', 'trial_lick', 'time_bin')
+      
+      df_fp_peth_summary_means_binnedtrials_triallick <- df_fp_peth %>%
+        left_join(join_info) %>%
+        mutate(bin_trial = cut(trial_num, seq(0,100, 10), labels = sprintf("%02d", seq(0,90,10)))) %>%
+        mutate(bin_trial = bin_trial %>% as.character()) %>%
+        get_peth_binned_summary(peth_tm_bins, grouping_vars)
+      
+      df_fp_peth_summary_means_binnedtrials_triallick %>%
+        write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_binnedtrial_triallick.csv'))
+    }
+    
+    # derivative summary
+    if(toggle_filt_trial_lick == 1){
+      df_kinetics <- df_fp_peth %>%
+        left_join(log_analysis_fp %>% select(blockname, deprivation), by = 'blockname') 
+      
+      kenetics_list <- get_kinetics(
+        df = df_kinetics,
+        var_dv = 'zscore_blsub', 
+        rise_time_tresh = 0.25
+      )
+      
+      # save derivative trace 
+      kenetics_list[[1]] %>%
+        write_csv(str_c(dir_output, fn_prefix, '_',  'pethkinetics_summary_trace_subject.csv'))
+        
+      # save derivative summary trial
+      kenetics_list[[2]] %>%
+        write_csv(str_c(dir_output, fn_prefix, '_',  'pethkinetics_summary_means_trial.csv'))
+      
+      # save derivative summary solution
+      kenetics_list[[3]]  %>%
+        write_csv(str_c(dir_output, fn_prefix, '_',  'pethkinetics_summary_means_subject.csv'))
+    }
+    
+    # get analysis_info and export
+    meta_countfibers <- df_fp_peth %>%
+      group_by(blockname, region) %>%
+      filter(time == min(time)) %>%
+      group_by(region) %>%
+      summarise( count_fibers = n()) %>%
+      mutate(region = str_c('n_', region)) %>%
+      spread(region, count_fibers)
+    
+    meta_countsubjects <- df_fp_peth %>%
+      filter(time_rel == 0) %>%
+      select(subject) %>%
+      unique() %>%
+      summarise(count_subject = n())
+    
+    
+    meta_counttrials_all <- df_fp_peth %>%
+      filter(time_rel == 0) %>%
+      group_by(region) %>%
+      summarise(count_trials_solution = n())  %>%
+      mutate(set_id = loop_set_id) %>%
+      select(set_id, everything()) 
+    
+    meta_counttrials_all %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'meta_count_trial_all.csv'))
+    
+    meta_counttrials_solution <- df_fp_peth %>%
+      filter(time_rel == 0) %>%
+      group_by(region, solution) %>%
+      summarise(count_trials_solution = n())  %>%
+      mutate(set_id = loop_set_id) %>%
+      select(set_id, everything())
+    
+    meta_counttrials_solution %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'meta_count_trial_solution.csv'))
+    
+    # save export
+    analysis_summary <- tibble(
+        set_id = loop_set_id,
+        toggle_filt_trial_lick = toggle_filt_trial_lick
+      ) %>%
+      bind_cols(meta_countsubjects) %>%
+      bind_cols(meta_countfibers) 
+    
+    analysis_summary %>%
+      write_csv(str_c(dir_output, fn_prefix, '_',  'meta_setid.csv'))
+  }
+}
+```
+
+### correlation for 6 fiber subjects
+```{r}
+
+# 6 fiber inclusion
+blocknames_6fibers <- log_analysis_fp 
+
+# remove subjects
+blocknames_6fibers <- blocknames_6fibers %>%
+  filter(!subject %in% subjects_to_remove) 
+
+# join in regions
+blocknames_6fibers <- blocknames_6fibers %>%
+  left_join(log_npm %>% select(blockname, region))
+
+
+# filter out sessions with poor signal on at least 1 fiber
+blocknames_6fibers <- blocknames_6fibers %>%
+  left_join(combined_qc_metrics %>% select(blockname, region, exclude_poor_signal), by = c('blockname', 'region')) %>%
+  filter(exclude_poor_signal == 0 | is.na(exclude_poor_signal)) %>% # is.na for lha ratio
+  select(-exclude_poor_signal)
+
+# filter out subjects with at least 1 removed fiber
+blocknames_6fibers <- blocknames_6fibers %>%
+  format_regions('region',key_regions) %>%
+  filter_placements('exclude_da_consumption') # filter fibers
+
+
+# filter to sessions with 6 fibers
+blocknames_6fibers <- blocknames_6fibers %>%
+  group_by(blockname) %>%
+  mutate(region_count = n()) %>%
+  ungroup() %>%
+  filter(region_count == 6)
+
+# return unique blocknames
+#blocknames_6fibers <- blocknames_6fibers$blockname %>% unique()
+blocknames_6fibers <- blocknames_6fibers %>%
+  get_set_id() %>%
+  select(subject, blockname, procedure, set_id) %>%
+  unique() %>%
+  filter(!is.na(set_id))
+```
+
+
+```{r}
+subject_x_set <- blocknames_6fibers %>%
+  select(subject, set_id) %>%
+  unique()
+
+print('preprocessing correlation for subjects with 6 fibers combined for each set_id...')
+
+for(n_subject_x_set in seq(1, nrow(subject_x_set))){
+  
+  loop_subject_x_set <- subject_x_set[n_subject_x_set,]
+  
+  print(str_c(' ~ ', loop_subject_x_set$subject, '_', loop_subject_x_set$set_id, ' [', n_subject_x_set, ' / ', nrow(subject_x_set), ']'))
+  
+  loop_dir_output <- str_c(dir_sessions_combined_subject, loop_subject_x_set$subject, '_', loop_subject_x_set$set_id, '/corelation/')
+  
+  # create directory if it does not already exist
+  if(!dir.exists(loop_dir_output)){
+    dir.create(loop_dir_output, recursive = T)
+  }
+  
+  # combine blocknames for peth and baseline, then pivot wide, and save dataframes
+  loop_blocknames <- blocknames_6fibers %>%
+    filter(subject == loop_subject_x_set$subject, 
+           set_id == loop_subject_x_set$set_id) %>%
+    pull(blockname)
+  
+  # baseline
+  df_bl <- combine_session_fp_bl(loop_blocknames, dir_localdata_sessions) %>%
+    mutate(subject = loop_subject_x_set$subject, 
+           set_id = loop_subject_x_set$set_id)
+  
+  df_bl <- df_bl %>%
+    select(blockname, subject, set_id, time, region, zscore) %>%
+    spread(region, zscore)
+
+  df_bl %>%
+    write_feather(str_c(loop_dir_output, 'streams_baseline_cor_data.feather'))
+  
+  # peth
+  df_peth <- combine_session_fp(loop_blocknames, dir_localdata_sessions) %>%
+    mutate(subject = loop_subject_x_set$subject, 
+           set_id = loop_subject_x_set$set_id) %>%
+    filter(trial_lick == 1) %>%
+    filter(time_rel > -3, time_rel <= 9)
+  
+  
+    meta_temp <- df_peth %>% 
+    filter(time_rel == 0) 
+  
+    n_sessions <- meta_temp %>%
+      select(blockname) %>%
+      unique()%>%
+      nrow()
+    
+    n_trial <- meta_temp %>%
+      select(blockname, trial_num) %>%
+      unique() %>%
+      nrow()
+    
+  tibble(
+    n_sessions = n_sessions,
+    n_trial = n_trial,
+    filt_lick = 1
+  ) %>%
+    write_csv(str_c(loop_dir_output, 'streams_peth_cor_meta.csv'))
+  
+  df_peth <- df_peth %>%
+    select(blockname, subject, set_id, trial_num, solution, time, time_rel, region, zscore_blsub) %>%
+    spread(region, zscore_blsub)
+  
+  df_peth %>%
+    write_feather(str_c(loop_dir_output, 'streams_peth_cor_data.feather'))
+  
+  # determine number of trials for each solution
+  trial_counts <- df_peth %>%
+    select(c(c('nac', 'nac_shelllat', 'nac_corr', 'dms', 'dls', 'ts'), c('subject', 'set_id', 'solution', 'time_rel'))) %>%
+    group_by_at(c('subject', 'set_id', 'solution', 'time_rel')) %>%
+    summarise(count = n()) %>%
+    select(count) %>%
+    unique() 
+  
+  if(min(trial_counts$count) > 4){
+    # compute correlations, summaries, and write 
+    ## baseline
+    corr_baseline <- tidy_cormatrix(df_bl, c('nac', 'nac_shelllat', 'nac_corr', 'dms', 'dls', 'ts'), c('subject', 'set_id')) %>%
+      format_regions('var_y', key_regions) %>%
+      format_regions('var_x', key_regions) 
+    
+    corr_baseline %>%
+      write_csv(str_c(loop_dir_output, 'streams_baseline_corr.csv'))
+    
+    ## peth - time_rel
+    corr_peth_timerel <- tidy_cormatrix(df_peth, c('nac', 'nac_shelllat', 'nac_corr', 'dms', 'dls', 'ts'), c('subject', 'set_id', 'time_rel')) %>%
+      format_regions('var_y', key_regions) %>%
+      format_regions('var_x', key_regions)
+    
+    corr_peth_timerel %>%
+      write_csv(str_c(loop_dir_output, 'streams_peth_corr_timerel.csv'))
+    
+    ## peth - window 
+    corr_peth_access <- df_peth %>%
+      mutate(time_rel_bin = case_when(
+        time_rel > -2 & time_rel < 0 ~ 'Pre',
+        time_rel >= 1 & time_rel < 3 ~ 'Sustained',
+        time_rel >= 6 & time_rel < 8 ~ 'Post'
+      )) %>%
+      filter(!is.na(time_rel_bin)) %>%
+      tidy_cormatrix(c('nac', 'nac_shelllat', 'nac_corr', 'dms', 'dls', 'ts'), c('subject', 'set_id', 'time_rel_bin')) %>%
+      format_regions('var_y', key_regions) %>%
+      format_regions('var_x', key_regions)
+    
+    corr_peth_access %>%
+      write_csv(str_c(loop_dir_output, 'streams_peth_corr_windows.csv'))
+    
+    ## peth - solution x time_rel
+    corr_peth_timerel_sol <- tidy_cormatrix(df_peth, c('nac', 'nac_shelllat', 'nac_corr', 'dms', 'dls', 'ts'), c('subject', 'set_id', 'solution', 'time_rel')) %>%
+      format_regions('var_y', key_regions) %>%
+      format_regions('var_x', key_regions)
+    
+    corr_peth_timerel_sol %>%
+      write_csv(str_c(loop_dir_output, 'streams_peth_corr_timerel_sol.csv'))
+  } else {
+    print('**TOO FEW TRIALS FOR CORRELATION-- SKIPPING**')
+  }
+  
+  
+  
+}
+```
+
+
+
+
+```{r}
+combine_session_fp_bl <- function(process_blocknames, dir_localdata_sessions){
+  
+  for(process_blockname in process_blocknames){
+    dir_session_process <- str_c(dir_localdata_sessions, process_blockname, '/')
+    
+    ## read in fp data
+    df <- read_feather(str_c(dir_session_process, process_blockname, '_streams_baseline_preprocessed.feather')) %>%
+      select(any_of(c("blockname", "region", "time", "signal", "delta_signal_poly", "zscore", "zscore_blsub")))
+    
+    if(process_blockname == process_blocknames[1]){ # if first loop
+      df_combined <- df
+    } else {
+      df_combined <- df %>% bind_rows(df_combined,.)
+    }
+  }
+  
+  return(df_combined)
+}
+```
+
+
+
+### lick vs no-lick
+```{r}
+# summarise lick vs no lick across all main set_id
+run_licknolick_main_set_ids <- 0
+
+if(run_licknolick_main_set_ids == 1){
+  process_blocknames <- log_data %>%
+      filter(set_id %in% c('wrsuc', 'frsuc','wrnacl')) %>%
+      pull(blockname)
+    
+  # import peth and join in subject id
+  df_fp_peth <- combine_session_fp(process_blocknames, dir_localdata_sessions) %>%
+    left_join(log_analysis_fp %>% select(blockname, subject), by = 'blockname') 
+  
+  # exclude subjects defined in log_analysis_subjects
+  df_fp_peth <- df_fp_peth %>%
+    filter(!subject %in% subjects_to_remove)
+   
+  # exclude fibers with poor quality
+  df_fp_peth <- df_fp_peth %>%
+    left_join(combined_qc_metrics %>% select(blockname, region, exclude_poor_signal), by = c('blockname', 'region')) %>%
+    filter(exclude_poor_signal == 0 | is.na(exclude_poor_signal)) %>% # is.na for lha ratio
+    select(-exclude_poor_signal)
+  
+  # filter fibers based on log_placements
+  df_fp_peth <- df_fp_peth %>%
+    format_regions('region',key_regions) %>%
+    filter_placements('exclude_da_consumption') # filter fibers
+  
+  # filter time_rel
+  df_fp_peth <- df_fp_peth %>% 
+    filter(time_rel > peth_filt_fulltrace[1], time_rel < peth_filt_fulltrace[2])
+  
+  # process full dataset and only trials with licks 
+    
+  fn_prefix <- str_c('combined_main_set_id_lickvsnolick')
+  
+  
+  # fp trace - overall
+  df_fp_peth_summary_trace_overall <- df_fp_peth %>%
+    left_join(join_info) %>%
+    group_by(region, trial_lick, time_rel) %>%
+    get_mean_signals() 
+  
+  df_fp_peth_summary_trace_overall %>%
+    write_csv(str_c(dir_output, fn_prefix, '_', 'peth_summary_trace_overall.csv'))
+  
+  
+  # fp trace - grouped by subject
+  df_fp_peth_summary_trace_subject <- df_fp_peth %>%
+    left_join(join_info) %>%
+    group_by(experiment, subject, region, trial_lick, time_rel) %>%
+    get_mean_signals()
+  
+  df_fp_peth_summary_trace_subject %>%
+    write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_trace_subject.csv'))
+  
+  
+  # fp summary - trial
+  grouping_vars <- c('experiment', 'blockname', 'subject', 'set_id', 'region', 'trial_num', 'trial_lick', 'time_bin', 'lick_count', 'lick_ts_first', 'lick_ts_last')
+  
+  df_fp_peth_summary_means_trial <- df_fp_peth %>%
+    left_join(join_info) %>%
+    get_peth_binned_summary(peth_tm_bins, grouping_vars)
+  
+  df_fp_peth_summary_means_trial %>%
+    write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_trial.csv'))
+  
+  
+  # fp summary - binned trial
+  grouping_vars <- c('experiment', 'blockname', 'subject', 'region', 'bin_trial', 'trial_lick', 'time_bin')
+  
+  df_fp_peth_summary_means_binnedtrials <- df_fp_peth %>%
+    left_join(join_info) %>%
+    mutate(bin_trial = cut(trial_num, seq(0,100, 10), labels = sprintf("%02d", seq(0,90,10)))) %>%
+    mutate(bin_trial = bin_trial %>% as.character()) %>%
+    get_peth_binned_summary(peth_tm_bins, grouping_vars)
+  
+  df_fp_peth_summary_means_binnedtrials %>%
+    write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_binnedtrial.csv'))
+  
+  # fp summary - subject
+  grouping_vars <- c('experiment', 'subject', 'region', 'trial_lick', 'time_bin')
+  
+  df_fp_peth_summary_means_subject <- df_fp_peth %>%
+    select(-subject) %>%
+    left_join(join_info, by = join_by(blockname)) %>%
+    get_peth_binned_summary(peth_tm_bins, grouping_vars)
+  
+  df_fp_peth_summary_means_subject %>%
+    write_csv(str_c(dir_output, fn_prefix, '_',  'peth_summary_means_subject.csv'))
+  
+  # get analysis_info and export
+  meta_countfibers <- df_fp_peth %>%
+    group_by(blockname, region) %>%
+    filter(time == min(time)) %>%
+    group_by(region) %>%
+    summarise( count_fibers = n()) %>%
+    mutate(region = str_c('n_', region)) %>%
+    spread(region, count_fibers)
+  
+  meta_countsubjects <- df_fp_peth %>%
+    filter(time_rel == 0) %>%
+    select(subject) %>%
+    unique() %>%
+    summarise(count_subject = n())
+  
+  
+  meta_counttrials_all <- df_fp_peth %>%
+    filter(time_rel == 0) %>%
+    group_by(region) %>%
+    summarise(count_trials_solution = n())  %>%
+    mutate(set_id = loop_set_id) %>%
+    select(set_id, everything()) 
+  
+  meta_counttrials_all %>%
+    write_csv(str_c(dir_output, fn_prefix, '_',  'meta_count_trial_all.csv'))
+  
+  meta_counttrials_solution <- df_fp_peth %>%
+    filter(time_rel == 0) %>%
+    group_by(region, solution) %>%
+    summarise(count_trials_solution = n())  %>%
+    mutate(set_id = loop_set_id) %>%
+    select(set_id, everything())
+  
+  meta_counttrials_solution %>%
+    write_csv(str_c(dir_output, fn_prefix, '_',  'meta_count_trial_solution.csv'))
+  
+  # save export
+  analysis_summary <- tibble(
+    set_id = loop_set_id,
+    toggle_filt_trial_lick = toggle_filt_trial_lick
+  ) %>%
+    bind_cols(meta_countsubjects) %>%
+    bind_cols(meta_countfibers) 
+  
+  analysis_summary %>%
+    write_csv(str_c(dir_output, fn_prefix, '_',  'meta_setid.csv'))
+}
+```
+
+
+### kinetics
+```{r}
+analysis_summary %>% write_csv(str_c(dir_output, fn_prefix, '_',  'meta_setid.csv'))
+```
+
+```{r}
+# nacl000 only
+plt_data_kinetics <- df_kinetic_summary_subject_region_solution %>%
+  filter(solution == 'nacl000') %>%
+  select(-solution) %>%
+  group_by(subject, region) %>%
+  summarise_all(mean)
+
+
+plt_summary_kinetics(
+  plt_data_kinetics = plt_data_kinetics, 
+  fn_stem_set = 'kinetics_nacl000'
+  )
+
+
+```
+
+
+# final
+## lha
+```{r}
+dir_output_fp_lha <- './analysis_output/peth_lha/'
+
+filt_and_format_data <- function(df){
+  df %>% 
+    filter(region %>% str_detect('LHA')) %>%
+    filter(set_id %in% c('frsuc', 'wrsuc', 'wrnacl')) %>%
+    mutate(region = region %>% factor(levels = unique(key_regions$region_label))) %>%
+    format_set_id(key_set_id) 
+}
+
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('filtlick')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('peth_summary_trace_overal')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]]
+
+plt_data <- df %>% 
+  filt_and_format_data()
+```
+
+### trace
+```{r}
+fn_stem <- 'fp_lha_trace'
+
+plt <- plt_data %>%
+  ggplot(aes(time_rel, zscore_blsub_mean, group = solution, color = solution, fill = solution)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_ribbon(
+    aes(
+      ymin = zscore_blsub_mean - zscore_blsub_sem,
+      ymax
+      = zscore_blsub_mean + zscore_blsub_sem
+        ),
+    alpha = 1/3,
+    color = NA
+    ) +
+  geom_line() +
+  facet_grid(set_id~region) +
+  scale_color_manual(values = c(color_values_nacl, color_values_suc)) +
+  scale_fill_manual(values = c(color_values_nacl, color_values_suc)) +
+  theme_ag01() +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing.y = unit(1, "lines")) +
+  force_panelsizes(rows = unit(2, 'cm'), cols = unit(2, 'cm'))
+
+
+plt <- plt %>%
+  add_scale_bar(
+    origin = c(-3, -1), 
+    x_len = 1, 
+    y_len = 1
+  )
+
+plt
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+```
+
+### summary - sustained
+```{r}
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('filtlick')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('peth_summary_means_subject')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]] %>% 
+  filt_and_format_data() %>%
+  mutate(region_facet = case_when(
+    region == 'LHA:Ratio' ~ 2,
+    region == 'LHA:GABA' ~ 1,
+    region == 'LHA:Glut' ~ 1
+  )) 
+```
+
+#### wr suc
+
+```{r}
+fn_stem <- 'fp_lha_summary_wrsuc'
+
+plt_data <- df %>%
+  filter(set_id == 'WR:Suc') %>%
+  filter(time_bin == 'sustained') 
+
+
+plt_data %>%
+  ggplot(aes(solution, zscore_blsub_mean, color = region)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = region), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(set_id~., scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-2, 3), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  ylab('Z-score sustained (2-3 s)') +
+  xlab('')
+
+
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+plt_data %>%
+  filter(region %in% c('LHA:GABA', 'LHA:Glut')) %>%
+  aov_rm_two_within(dir_output_fp_lha,str_c(fn_stem,'_interaction'), 'subject','zscore_blsub_mean','region', 'solution')
+
+
+plt_data %>%
+  filter(region == 'LHA:GABA') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_gaba'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Glut') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_glut'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Ratio') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_ratio'), 'subject','zscore_blsub_mean','solution')
+
+save_aov
+```
+
+#### fr suc
+```{r}
+fn_stem <- 'fp_lha_summary_frsuc'
+
+plt_data <- df %>%
+  filter(set_id == 'FR:Suc') %>%
+  filter(time_bin == 'sustained') 
+
+
+plt_data %>%
+  ggplot(aes(solution, zscore_blsub_mean, color = region)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = region), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(set_id~., scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-2, 3), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  ylab('Z-score sustained (2-3 s)') +
+  xlab('')
+
+
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+plt_data %>%
+  filter(region %in% c('LHA:GABA', 'LHA:Glut')) %>%
+  aov_rm_two_within(dir_output_fp_lha,str_c(fn_stem,'_interaction'), 'subject','zscore_blsub_mean','region', 'solution')
+
+
+plt_data %>%
+  filter(region == 'LHA:GABA') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_gaba'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Glut') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_glut'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Ratio') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_ratio'), 'subject','zscore_blsub_mean','solution')
+```
+
+
+#### wr nacl
+```{r}
+fn_stem <- 'fp_lha_summary_wrnacl'
+
+plt_data <- df %>%
+  filter(set_id == 'WR:NaCl') %>%
+  filter(time_bin == 'sustained') 
+
+
+plt_data %>%
+  ggplot(aes(solution, zscore_blsub_mean, color = region)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = region), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(set_id~., scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-2, 3), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  ylab('Z-score sustained (2-3 s)') +
+  xlab('')
+
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+plt_data %>%
+  filter(region %in% c('LHA:GABA', 'LHA:Glut')) %>%
+  aov_rm_two_within(dir_output_fp_lha,str_c(fn_stem,'_interaction'), 'subject','zscore_blsub_mean','region', 'solution')
+
+
+plt_data %>%
+  filter(region == 'LHA:GABA') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_gaba'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Glut') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_glut'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Ratio') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_ratio'), 'subject','zscore_blsub_mean','solution')
+
+```
+
+#### range
+```{r}
+fn_stem <- 'fp_lha_range'
+
+plt_data <-  df %>%
+  filter(time_bin == 'sustained') %>%
+  select(set_id, subject, region, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl000') ~ 'low',
+    solution %in% c('sucrose30', 'nacl150') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+
+
+plt_data %>%
+  ggplot(aes(set_id, abs(range), fill = region, color = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', position = position_dodge(width = 0.7), width = 0.4) +
+  stat_summary(fun = 'mean', geom = 'col', position = position_dodge(width = 0.7), width = 0.6) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.3, dodge.width = 0.7), shape = 21, color = 'white', stroke = 0.25, size = 2) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  scale_fill_manual(values = color_values_regions) +
+  ylab('|Range FP Z-Score|') +
+  xlab('') +
+  coord_cartesian(xlim = c(0.5, 3.5), ylim = c(0, 5), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(3,'cm'), cols = unit(6, 'cm')) 
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+stats_list <- plt_data %>%
+  aov_rm_two_within(dir_output_fp_lha,fn_stem,'subject','range','region','set_id')
+
+
+
+```
+
+```{r}
+plt_data %>%
+  filter(region == 'LHA:GABA') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem, 'lhagaba'),'subject','range','set_id')
+
+plt_data %>%
+  filter(region == 'LHA:Glut') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem, 'lhaglut'),'subject','range','set_id')
+
+plt_data %>%
+  filter(region == 'LHA:Ratio') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem, 'lhaglut'),'subject','range','set_id')
+```
+
+
+
+```{r}
+stats_list[[3]] %>%
+  select(starts_with('contrast'), p_value, sig_symbol) %>%
+  filter(contrast1_within1 == contrast2_within1)
+
+
+stats_list[[3]] %>%
+  select(starts_with('contrast'), p_value, sig_symbol) %>%
+  filter(contrast1_within2 == contrast2_within2)
+
+
+```
+
+#### corr range vs licking
+```{r}
+fn_stem <- 'fp_lha_cor_range_vs_licking'
+
+# fp data
+plt_data <-  df %>%
+  filter(time_bin == 'sustained') %>%
+  select(set_id, subject, region, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl000') ~ 'low',
+    solution %in% c('sucrose30', 'nacl150') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+
+# licking data
+process_blocknames <- log_analysis_fp %>%
+  filter(procedure %>% str_detect('multi')) %>%
+  filter(subject %in% unique(plt_data$subject)) %>%
+  pull(blockname)
+
+df_spout_summary_combined <- combine_session_files(process_blocknames, dir_localdata_sessions, '_data_spout_summary.csv')
+
+join_info <- log_analysis_fp %>% 
+  get_set_id() %>% 
+  select(blockname, experiment, subject, set_id)
+
+df_spout_summary_combined <- df_spout_summary_combined %>%
+  left_join(join_info) %>%
+  group_by(experiment, subject, set_id, solution) %>%
+  summarise(lick_count_trial_mean = mean(lick_count_trial_mean), 
+            trial_lick_proportion = mean(trial_lick_proportion)) %>%
+  format_set_id(key_set_id)
+
+df_spout_summary_combined <- df_spout_summary_combined %>%
+  select(set_id, subject, solution, lick_count_trial_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl000') ~ 'low',
+    solution %in% c('sucrose30', 'nacl150') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, lick_count_trial_mean) %>%
+  mutate(range_lick = high - low) %>%
+  select(-high, -low)
+
+plt_data <- plt_data %>%
+  left_join(df_spout_summary_combined)
+```
+
+```{r}
+fn_stem <- 'fp_lha_rangelick_vs_rangefp'
+
+plt_data %>%
+  ggplot(aes(abs(range_lick), abs(range), color = set_id)) +
+  geom_point() + 
+  facet_grid(.~region, scales = 'free') +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5, aes( group = 1), color = 'black') +
+  stat_cor(method = "pearson", size = 1.5, aes( group = 1), color = 'black') +
+  theme_ag01() +
+  scale_color_manual(values = color_values_experiment_set) +
+  scale_fill_manual(values = color_values_experiment_set) +
+  ylab('|Range FP Z-Score|') +
+  xlab('|Range Consumption|') +
+  coord_cartesian(xlim = c(0, 30), ylim = c(0, 6), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(3,'cm'), cols = unit(1.5, 'cm')) +
+  theme(panel.spacing = unit(1, "lines"))
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+```
+
+
+
+### summary - post
+```{r}
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('filtlick')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('peth_summary_means_subject')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]] %>% 
+  filt_and_format_data() %>%  
+  mutate(region_facet = case_when(
+    region == 'LHA:Ratio' ~ 2,
+    region == 'LHA:GABA' ~ 1,
+    region == 'LHA:Glut' ~ 1
+  )) 
+```
+
+#### wr suc
+
+```{r}
+fn_stem <- 'fp_lha_summary_wrsuc_post'
+
+plt_data <- df %>%
+  filter(set_id == 'WR:Suc') %>%
+  filter(time_bin == 'post') 
+
+
+plt_data %>%
+  ggplot(aes(solution, zscore_blsub_mean, color = region)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = region), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(set_id~., scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-0.5, 1), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  ylab('Z-score post (6-8 s)') +
+  xlab('')
+
+
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+plt_data %>%
+  filter(region %in% c('LHA:GABA', 'LHA:Glut')) %>%
+  aov_rm_two_within(dir_output_fp_lha,str_c(fn_stem,'_interaction'), 'subject','zscore_blsub_mean','region', 'solution')
+
+
+plt_data %>%
+  filter(region == 'LHA:GABA') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_gaba'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Glut') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_glut'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Ratio') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_ratio'), 'subject','zscore_blsub_mean','solution')
+
+```
+
+#### fr suc
+```{r}
+fn_stem <- 'fp_lha_summary_frsuc_post'
+
+plt_data <- df %>%
+  filter(set_id == 'FR:Suc') %>%
+  filter(time_bin == 'post') 
+
+
+plt_data %>%
+  ggplot(aes(solution, zscore_blsub_mean, color = region)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = region), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(set_id~., scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-0.5, 1), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  ylab('Z-score post (6-8 s)') +
+  xlab('')
+
+
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+plt_data %>%
+  filter(region %in% c('LHA:GABA', 'LHA:Glut')) %>%
+  aov_rm_two_within(dir_output_fp_lha,str_c(fn_stem,'_interaction'), 'subject','zscore_blsub_mean','region', 'solution')
+
+
+plt_data %>%
+  filter(region == 'LHA:GABA') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_gaba'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Glut') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_glut'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Ratio') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_ratio'), 'subject','zscore_blsub_mean','solution')
+```
+
+
+#### wr nacl
+```{r}
+fn_stem <- 'fp_lha_summary_wrnacl_post'
+
+plt_data <- df %>%
+  filter(set_id == 'WR:NaCl') %>%
+  filter(time_bin == 'post') 
+
+
+plt_data %>%
+  ggplot(aes(solution, zscore_blsub_mean, color = region)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = region), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(set_id~., scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-0.5, 1), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  ylab('Z-score post (6-8 s)') +
+  xlab('')
+
+
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+
+plt_data %>%
+  filter(region %in% c('LHA:GABA', 'LHA:Glut')) %>%
+  aov_rm_two_within(dir_output_fp_lha,str_c(fn_stem,'_interaction'), 'subject','zscore_blsub_mean','region', 'solution')
+
+plt_data %>%
+  filter(region == 'LHA:GABA') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_gaba'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Glut') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_glut'), 'subject','zscore_blsub_mean','solution')
+
+plt_data %>%
+  filter(region == 'LHA:Ratio') %>%
+  aov_rm_one_within(dir_output_fp_lha,str_c(fn_stem,'_ratio'), 'subject','zscore_blsub_mean','solution')
+
+```
+
+```{r}
+first_loop <- 1
+
+for(loop_set_id in sort(unique(plt_data$set_id))){
+  
+  df_set <- plt_data %>%
+    filter(set_id == loop_set_id)
+  
+  for(loop_region in sort(unique(df_set$region))){
+    for(loop_time_bin in sort(unique(df_set$time_bin))) {
+      
+      stats_results <- df_set %>%
+        filter(region == loop_region) %>%
+        filter(time_bin == loop_time_bin) %>%
+        aov_rm_one_within(NA,NA,'subject','zscore_blsub_mean','solution')
+      
+      
+      stats_results[[2]]  <- stats_results[[2]] %>%
+          mutate(set_id = loop_set_id,
+                 region = loop_region,
+                 time_bin = loop_time_bin) %>%
+          select(set_id, region, time_bin, everything())
+      
+      stats_results[[3]] <- stats_results[[3]] %>%
+          mutate(set_id = loop_set_id,
+                 region = loop_region,
+                 time_bin = loop_time_bin) %>%
+          select(set_id, region, time_bin, everything())
+      
+      if(first_loop){
+        combined_aov <- stats_results[[2]] 
+        combined_ph <- stats_results[[3]]
+        first_loop <- 0
+      } else {
+        combined_aov <- stats_results[[2]] %>%
+          bind_rows(combined_aov,.)
+        combined_ph <- stats_results[[3]]%>%
+          bind_rows(combined_ph,.)
+        
+      }
+      
+      
+    }
+  }
+}
+
+combined_aov %>%
+  mutate(region = region %>% factor(levels = key_regions$region_label %>% unique())) %>%
+  filter(time_bin != 'baseline') %>%
+  filter(effect == 'solution') %>%
+  select(set_id, region, time_bin, sig_symbol) %>%
+  filter(sig_symbol != 'n.s.') %>%
+  ggplot(aes(region, set_id, label = sig_symbol)) +
+  geom_text() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  facet_grid(time_bin~.)
+
+plt_data %>%
+  filter(!subject %>% str_detect('abw')) %>%
+  select(set_id, region, subject) %>%
+  unique() %>%
+  group_by(set_id, region) %>%
+  filter(!region %in% c('LHA:GABA', 'LHA:Glut')) %>%
+  summarise(fiber_count = n()) 
+
+```
+
+
+
+### corr lick vs resp
+```{r}
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('peth_summary_means_trial_triallick')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]] %>% 
+  filt_and_format_data() %>%  
+  mutate(region_facet = case_when(
+    region == 'LHA:Ratio' ~ 2,
+    region == 'LHA:GABA' ~ 1,
+    region == 'LHA:Glut' ~ 1
+  )) %>%
+  filter(trial_lick == 1)
+```
+
+
+```{r, fig.width = 9, fig.height = 6}
+
+fn_stem <- 'fp_lha_cor_zscore_vs_lick'
+
+df %>%
+  filter(time_bin == 'sustained') %>%
+  ggplot(aes(zscore_blsub_mean, lick_count)) +
+  geom_jitter(size = 0.1, alpha = 1/8) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5, color = 'black') +
+  stat_cor(method = "pearson", label.y = 30, label.x = 0, size = 2) +
+  facet_grid(set_id~region) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(-6,12), ylim = c(0,30), expand = F, clip = 'off') +
+  scale_x_continuous(breaks = seq(-6,12,6)) +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing = unit(1, "lines")) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(4, 'cm'))
+
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+```
+
+```{r}
+corr_sbj <- df %>%
+  filter(trial_lick == 1) %>%
+  filter(time_bin == 'sustained') %>%
+  tidy_cor('zscore_blsub_mean', 'lick_count', 'subject', 'region', 'set_id') %>%
+  mutate(estimate_squared = estimate^2)
+
+
+fn_stem <- 'fp_lha_cor_zscore_vs_lick_subject_summary_wrsuc' #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+plt_data <- corr_sbj %>%
+  filter(set_id == 'WR:Suc') 
+
+plt_data %>%
+  ggplot(aes(region, estimate_squared)) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.25) +
+  geom_line(aes(group = subject), alpha = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = set_id)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = set_id), width = 0) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5,3.5), ylim = c(0,0.3), expand = F, clip = 'off') +
+  scale_y_continuous(breaks = seq(0,0.3,0.1)) +
+  facet_grid(set_id~., scales = 'free')+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing = unit(1, "lines")) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2, 'cm'))
+ 
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+plt_data %>% aov_rm_one_within(dir_output_fp_lha,fn_stem,'subject','estimate_squared', 'region')
+
+fn_stem <- 'fp_lha_cor_zscore_vs_lick_subject_summary_frsuc' #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+plt_data <- corr_sbj %>%
+  filter(set_id == 'FR:Suc')
+
+plt_data %>%
+  ggplot(aes(region, estimate_squared)) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.25) +
+  geom_line(aes(group = subject), alpha = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = set_id)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = set_id), width = 0) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5,3.5), ylim = c(0,0.6), expand = F, clip = 'off') +
+  scale_y_continuous(breaks = seq(0,0.6,0.2)) +
+  facet_grid(set_id~., scales = 'free')+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing = unit(1, "lines")) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2, 'cm'))
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+plt_data %>% aov_rm_one_within(dir_output_fp_lha,fn_stem,'subject','estimate_squared', 'region')
+
+fn_stem <- 'fp_lha_cor_zscore_vs_lick_subject_summary_wrnacl' #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+plt_data <- corr_sbj %>%
+  filter(set_id == 'WR:NaCl')
+
+plt_data %>%
+  ggplot(aes(region, estimate_squared)) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.25) +
+  geom_line(aes(group = subject), alpha = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = set_id)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = set_id), width = 0) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5,3.5), ylim = c(0,0.8), expand = F, clip = 'off') +
+  scale_y_continuous(breaks = seq(0,0.8,0.2)) +
+  facet_grid(set_id~., scales = 'free')+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing = unit(1, "lines")) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2, 'cm'))
+
+save_pdf(dir_output_fp_lha, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_lha, fn_stem, '_data.csv'))
+plt_data %>% aov_rm_one_within(dir_output_fp_lha,fn_stem,'subject','estimate_squared', 'region')
+```
+
+```{r}
+corr_sbj %>%
+  filter(set_id == 'WR:Suc') %>%
+  aov_rm_one_within(NA,NA,'subject','estimate_squared', 'region')
+
+corr_sbj %>%
+  filter(set_id == 'FR:Suc') %>%
+  aov_rm_one_within(NA,NA,'subject','estimate_squared', 'region')
+
+corr_sbj %>%
+  filter(set_id == 'WR:NaCl') %>%
+  aov_rm_one_within(NA,NA,'subject','estimate_squared', 'region')
+```
+
+
+
+```{r}
+breakhereplease
+```
+
+
+## str
+```{r}
+dir_output_fp_str <- './analysis_output/peth_str/'
+
+filt_and_format_data <- function(df){
+  
+  df %>% 
+    filter(!region %>% str_detect('LHA')) %>%
+    filter(set_id %in% c('frsuc', 'wrsuc', 'wrnacl')) %>%
+    mutate(region = region %>% factor(levels = unique(key_regions$region_label))) %>%
+    format_set_id(key_set_id) 
+  
+}
+
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('filtlick')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('peth_summary_trace_overal')]
+fns_filt <- fns_filt[fns_filt != 'filtlick_peth_summary_trace_overall.csv']
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]]
+
+plt_data <- df %>% 
+  filt_and_format_data()
+
+```
+
+
+### trace 
+```{r, fig.width = 12, fig.height = 5}
+fn_stem <- 'fp_str_trace'
+
+plt <- plt_data %>%
+  ggplot(aes(time_rel, zscore_blsub_mean, group = solution, color = solution, fill = solution)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_ribbon(
+    aes(
+      ymin = zscore_blsub_mean - zscore_blsub_sem,
+      ymax
+      = zscore_blsub_mean + zscore_blsub_sem
+        ),
+    alpha = 1/3,
+    color = NA
+    ) +
+  geom_line() +
+  facet_grid(set_id~region) +
+  scale_color_manual(values = c(color_values_nacl, color_values_suc)) +
+  scale_fill_manual(values = c(color_values_nacl, color_values_suc)) +
+  theme_ag01() +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing.y = unit(0.5, "lines")) +
+  force_panelsizes(rows = unit(2, 'cm'), cols = unit(2.3, 'cm'))
+
+
+plt <- plt %>%
+  add_scale_bar(
+    origin = c(-3, -1), 
+    x_len = 1, 
+    y_len = 1
+  )
+
+plt
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 9, 4)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+```
+
+
+### summary
+```{r}
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('filtlick')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('peth_summary_means_subject')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]] %>% 
+  filt_and_format_data() 
+```
+
+#### combined stats - sustained
+```{r}
+stats_data <- df %>%
+  filter(time_bin == 'sustained') 
+
+set_ids <- stats_data$set_id %>% unique()
+regions <- stats_data$region %>% unique()
+
+first_loop <- 1
+
+for(loop_set_id in set_ids){
+  for(loop_region in regions){
+    stats_list <- stats_data %>%
+      filter(
+        set_id == loop_set_id,
+        region == loop_region
+      ) %>%
+      aov_rm_one_within(NA,NA, 'subject','zscore_blsub_mean','solution')
+    
+    
+    stats_list[[2]] <- stats_list[[2]] %>% 
+      mutate(set_id = loop_set_id, region = loop_region) %>%
+      select(set_id, region, everything())
+    
+    stats_list[[3]] <- stats_list[[3]] %>% 
+      mutate(set_id = loop_set_id, region = loop_region) %>%
+      select(set_id, region, everything())
+    
+    if(first_loop == 1){
+      combined_aov <- stats_list[[2]]
+      combined_hsd <- stats_list[[3]]
+      first_loop <- 0
+    } else {
+      combined_aov <- stats_list[[2]] %>% bind_rows(combined_aov,.)
+      combined_hsd <- stats_list[[3]] %>% bind_rows(combined_hsd,.)
+      }
+    
+  }
+}
+
+combined_aov %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_sustained_combined_stats_aov.csv'))
+
+combined_hsd %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_sustained_combined_stats_hsd.csv'))
+```
+
+```{r}
+combined_aov %>%
+  mutate(region = factor(region, levels = key_regions$region_label %>% unique())) %>%
+  filter(effect == 'solution') %>%
+  select(set_id, region, p_value) %>%
+  quick_sig() %>%
+  ggplot(aes(region, set_id, label = sig_symbol)) +
+  geom_text()
+```
+
+
+```{r}
+stats_data <- df %>%
+  filter(set_id %in% c('WR:Suc', 'FR:Suc')) %>%
+  filter(time_bin == 'sustained') 
+
+regions <- stats_data$region %>% unique()
+
+first_loop <- 1
+
+for(loop_region in regions){
+  
+  stats_list <- stats_data %>%
+    filter(
+      region == loop_region
+    ) %>%
+    aov_rm_two_within(NA,NA, 'subject','zscore_blsub_mean','solution', 'set_id')
+  
+  
+  stats_list[[2]] <- stats_list[[2]] %>% 
+    mutate(region = loop_region) %>%
+    select(region, everything())
+  
+  stats_list[[3]] <- stats_list[[3]] %>% 
+    mutate(region = loop_region) %>%
+    select(region, everything())
+  
+  if(first_loop == 1){
+    combined_aov <- stats_list[[2]]
+    combined_hsd <- stats_list[[3]]
+    first_loop <- 0
+  } else {
+    combined_aov <- stats_list[[2]] %>% bind_rows(combined_aov,.)
+    combined_hsd <- stats_list[[3]] %>% bind_rows(combined_hsd,.)
+  }
+  
+}
+
+combined_aov %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_sustained_combined_interaction_stats_aov.csv'))
+
+combined_hsd %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_sustained_combined_interaction_stats_stats_hsd.csv'))
+```
+
+
+```{r}
+combined_aov %>%
+  mutate(region = factor(region, levels = key_regions$region_label %>% unique())) %>%
+  filter(effect == 'solution*set_id') %>%
+  select(region, p_value) %>%
+  quick_sig() %>%
+  ggplot(aes(region, 1, label = sig_symbol)) +
+  geom_text()
+```
+
+
+#### combined stats - post
+```{r}
+stats_data <- df %>%
+  filter(time_bin == 'post') 
+
+set_ids <- stats_data$set_id %>% unique()
+regions <- stats_data$region %>% unique()
+
+first_loop <- 1
+
+for(loop_set_id in set_ids){
+  for(loop_region in regions){
+    stats_list <- stats_data %>%
+      filter(
+        set_id == loop_set_id,
+        region == loop_region
+      ) %>%
+      aov_rm_one_within(NA,NA, 'subject','zscore_blsub_mean','solution')
+    
+    
+    stats_list[[2]] <- stats_list[[2]] %>% 
+      mutate(set_id = loop_set_id, region = loop_region) %>%
+      select(set_id, region, everything())
+    
+    stats_list[[3]] <- stats_list[[3]] %>% 
+      mutate(set_id = loop_set_id, region = loop_region) %>%
+      select(set_id, region, everything())
+    
+    if(first_loop == 1){
+      combined_aov <- stats_list[[2]]
+      combined_hsd <- stats_list[[3]]
+      first_loop <- 0
+    } else {
+      combined_aov <- stats_list[[2]] %>% bind_rows(combined_aov,.)
+      combined_hsd <- stats_list[[3]] %>% bind_rows(combined_hsd,.)
+      }
+    
+  }
+}
+
+combined_aov %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_post_combined_stats_aov.csv'))
+
+combined_hsd %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_post_combined_stats_hsd.csv'))
+
+df$time_bin %>% unique()
+```
+
+```{r}
+combined_aov %>%
+  mutate(region = factor(region, levels = key_regions$region_label %>% unique())) %>%
+  filter(effect == 'solution') %>%
+  select(set_id, region, p_value) %>%
+  quick_sig() %>%
+  ggplot(aes(region, set_id, label = sig_symbol)) +
+  geom_text()
+```
+
+
+```{r}
+stats_data <- df %>%
+  filter(set_id %in% c('WR:Suc', 'FR:Suc')) %>%
+  filter(time_bin == 'post') 
+
+regions <- stats_data$region %>% unique()
+
+first_loop <- 1
+
+for(loop_region in regions){
+  
+  stats_list <- stats_data %>%
+    filter(
+      region == loop_region
+    ) %>%
+    aov_rm_two_within(NA,NA, 'subject','zscore_blsub_mean','solution', 'set_id')
+  
+  
+  stats_list[[2]] <- stats_list[[2]] %>% 
+    mutate(region = loop_region) %>%
+    select(region, everything())
+  
+  stats_list[[3]] <- stats_list[[3]] %>% 
+    mutate(region = loop_region) %>%
+    select(region, everything())
+  
+  if(first_loop == 1){
+    combined_aov <- stats_list[[2]]
+    combined_hsd <- stats_list[[3]]
+    first_loop <- 0
+  } else {
+    combined_aov <- stats_list[[2]] %>% bind_rows(combined_aov,.)
+    combined_hsd <- stats_list[[3]] %>% bind_rows(combined_hsd,.)
+  }
+  
+}
+
+combined_aov %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_post_combined_interaction_stats_aov.csv'))
+
+combined_hsd %>%
+  write_csv(str_c(dir_output_fp_str, 'fp_str_summary_post_combined_interaction_stats_hsd.csv'))
+```
+
+
+```{r}
+combined_aov %>%
+  mutate(region = factor(region, levels = key_regions$region_label %>% unique())) %>%
+  filter(effect == 'solution*set_id') %>%
+  select(region, p_value) %>%
+  quick_sig() %>%
+  ggplot(aes(region, 1, label = sig_symbol)) +
+  geom_text()
+```
+
+#### combined plot
+```{r}
+
+```
+
+#### combined subject
+```{r, fig.height = 9, fig.width = 12}
+fn_stem <- 'fp_str_summary_combined_subject'
+
+plt_data <- df %>%
+  filter(time_bin %in% c('sustained', 'post')) %>%
+  mutate(time_bin = factor(time_bin, levels = c('sustained', 'post')))
+
+plt_data %>%
+  left_join(join_solution_x) %>%
+  ggplot(aes(plt_x, zscore_blsub_mean, color = set_id)) +
+  geom_line(aes(group = interaction(region, subject)), alpha = 1/4) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = set_id)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = set_id), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_experiment_set) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(interaction(set_id, time_bin)~region, scales = 'free') +
+  #facet_wrap(.~interaction(region, set_id, time_bin), scales = 'free', nrow = 6) +
+  #coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-1, 3), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1, 'cm')) +
+  #theme(strip.text.x = element_blank()) +
+  ylab('Z-score sustained (2-3 s)') +
+  xlab('')
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+```
+
+
+#### combined sustained
+```{r}
+fn_stem <- 'fp_str_summary_combined_sustained'
+
+plt_data <- df %>%
+  filter(time_bin == 'sustained') 
+
+plt_data %>%
+  left_join(join_solution_x) %>%
+  ggplot(aes(plt_x, zscore_blsub_mean, color = set_id)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = set_id)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = set_id), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_experiment_set) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(.~region, scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-2, 6), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  theme(strip.text = element_blank()) +
+  ylab('Z-score sustained (2-3 s)') +
+  xlab('')
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+```
+
+
+
+
+#### combined post
+```{r}
+fn_stem <- 'fp_str_summary_combined_post'
+
+plt_data <- df %>%
+  filter(time_bin == 'post') 
+
+plt_data %>%
+  left_join(join_solution_x) %>%
+  ggplot(aes(plt_x, zscore_blsub_mean, color = set_id)) +
+  #geom_line(aes(group = interaction(region, subject)), alpha = 1/3) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = set_id)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = set_id), width = 0) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_experiment_set) +
+  theme(axis.text.x = element_blank())+
+  facet_grid(.~region, scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 5.5), ylim = c(-1, 1.5), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(1.5, 'cm')) +
+  theme(strip.text = element_blank()) +
+  ylab('Z-score post (6-8 s)') +
+  xlab('')
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+
+
+```
+
+
+
+### range combined
+```{r}
+fn_stem <- 'fp_str_range_dodge'
+
+plt_data <-  df %>%
+  filter(time_bin == 'sustained') %>%
+  select(set_id, subject, region, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl150') ~ 'low',
+    solution %in% c('sucrose30', 'nacl000') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+
+
+plt_data %>%
+  ggplot(aes(set_id, range, fill = region, color = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', position = position_dodge(width = 0.9), width = 0.4) +
+  stat_summary(fun = 'mean', geom = 'col', position = position_dodge(width = 0.9), width = 0.75) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.3, dodge.width = 0.9), shape = 21, color = 'white', stroke = 0.25, size = 2) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions_da7) +
+  scale_fill_manual(values = color_values_regions_da7) +
+  ylab('Range') +
+  xlab('') +
+  coord_cartesian(xlim = c(0.5, 3.5), ylim = c(0, 10), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(3,'cm'), cols = unit(12, 'cm')) 
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+```
+
+
+```{r}
+fn_stem <- 'fp_str_range_sustained_heat'
+
+plt_data <-  df %>%
+  filter(time_bin == 'sustained') %>%
+  select(set_id, subject, region, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl150') ~ 'low',
+    solution %in% c('sucrose30', 'nacl000') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+  
+plt_data_summary <-plt_data %>%
+  group_by(set_id, region) %>%
+  summarise(range_mean = range %>% mean(), .groups = 'drop')
+
+plt_data_summary %>%
+  ggplot(aes(region, set_id, fill = range_mean)) +
+  geom_tile() +
+  scale_fill_viridis_c(limits = c(-1,5), oob = scales::squish) +
+  ylab('') +
+  xlab('') +
+  coord_cartesian(xlim = c(0.5, 7.5), ylim = c(0.5, 3.5), clip = 'off', expand = 0) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2.5, 'cm')) 
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+```
+
+```{r}
+fn_stem <- 'fp_str_range_post_heat'
+
+plt_data <-  df %>%
+  filter(time_bin == 'post') %>%
+  select(set_id, subject, region, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl150') ~ 'low',
+    solution %in% c('sucrose30', 'nacl000') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+  
+plt_data_summary <-plt_data %>%
+  group_by(set_id, region) %>%
+  summarise(range_mean = range %>% mean(), .groups = 'drop')
+ 
+plt_data_summary %>%
+  ggplot(aes(region, set_id, fill = range_mean)) +
+  geom_tile() +
+  scale_fill_viridis_c(limits = c(-1,2), oob = scales::squish) +
+  ylab('') +
+  xlab('') +
+  coord_cartesian(xlim = c(0.5, 7.5), ylim = c(0.5, 3.5), clip = 'off', expand = 0) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2.5, 'cm')) 
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+```
+
+```{r}
+plt_data <-  df %>%
+  filter(time_bin == 'sustained') %>%
+  select(set_id, subject, region, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl150') ~ 'low',
+    solution %in% c('sucrose30', 'nacl000') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+
+
+plt_range <- c(-5, 15)
+label_y <- 15
+
+
+plt01 <- plt_data %>%
+  select(set_id, subject, region, range) %>%
+  spread(set_id, range) %>%
+  ggplot(aes(`FR:Suc`, `WR:NaCl`)) +
+  geom_abline(slope = 1, intercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_point(shape = 21, fill = 'black', color = 'white', stroke = 0.1) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5) +
+  stat_cor(method = "pearson", size = 2, label.y = label_y, label.x = 0) +
+  theme_ag01() +
+  coord_cartesian(xlim = plt_range, ylim = plt_range, expand = F, clip = 'off') 
+
+
+plt02 <- plt_data %>%
+  select(set_id, subject, region, range) %>%
+  spread(set_id, range) %>%
+  ggplot(aes(`FR:Suc`, `WR:Suc`)) +
+  geom_abline(slope = 1, intercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_point(shape = 21, fill = 'black', color = 'white', stroke = 0.1) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5) +
+  stat_cor(method = "pearson", size = 2, label.y = label_y, label.x = 0) +
+  theme_ag01()+
+  coord_cartesian(xlim = plt_range, ylim = plt_range, expand = F, clip = 'off')
+
+plt03 <- plt_data %>%
+  select(set_id, subject, region, range) %>%
+  spread(set_id, range) %>%
+  ggplot(aes(`WR:Suc`, `WR:NaCl`)) +
+  geom_abline(slope = 1, intercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_point(shape = 21, fill = 'black', color = 'white', stroke = 0.1) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5) +
+  stat_cor(method = "pearson", size = 2, label.y = label_y, label.x = 0) +
+  theme_ag01()+
+  coord_cartesian(xlim = plt_range, ylim = plt_range, expand = F, clip = 'off')
+
+
+
+plt01 + plt02 + plt03 +
+  plot_layout(nrow = 1, widths = unit(3, 'cm'), heights = unit(3, 'cm'))
+```
+
+```{r}
+plt_data <-  df %>%
+  filter(time_bin == 'post') %>%
+  select(set_id, subject, region, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl150') ~ 'low',
+    solution %in% c('sucrose30', 'nacl000') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+
+
+plt_range <- c(-2.5, 5)
+label_y <- 5
+
+
+plt01 <- plt_data %>%
+  select(set_id, subject, region, range) %>%
+  spread(set_id, range) %>%
+  ggplot(aes(`FR:Suc`, `WR:NaCl`)) +
+  geom_abline(slope = 1, intercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_point(shape = 21, fill = 'black', color = 'white', stroke = 0.1) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5) +
+  stat_cor(method = "pearson", size = 2, label.y = label_y, label.x = 0) +
+  theme_ag01() +
+  coord_cartesian(xlim = plt_range, ylim = plt_range, expand = F, clip = 'off') 
+
+
+plt02 <- plt_data %>%
+  select(set_id, subject, region, range) %>%
+  spread(set_id, range) %>%
+  ggplot(aes(`FR:Suc`, `WR:Suc`)) +
+  geom_abline(slope = 1, intercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_point(shape = 21, fill = 'black', color = 'white', stroke = 0.1) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5) +
+  stat_cor(method = "pearson", size = 2, label.y = label_y, label.x = 0) +
+  theme_ag01()+
+  coord_cartesian(xlim = plt_range, ylim = plt_range, expand = F, clip = 'off')
+
+plt03 <- plt_data %>%
+  select(set_id, subject, region, range) %>%
+  spread(set_id, range) %>%
+  ggplot(aes(`WR:Suc`, `WR:NaCl`)) +
+  geom_abline(slope = 1, intercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_point(shape = 21, fill = 'black', color = 'white', stroke = 0.1) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5) +
+  stat_cor(method = "pearson", size = 2, label.y = label_y, label.x = 0) +
+  theme_ag01()+
+  coord_cartesian(xlim = plt_range, ylim = plt_range, expand = F, clip = 'off')
+
+
+plt01 + plt02 + plt03 +
+  plot_layout(nrow = 1, widths = unit(3, 'cm'), heights = unit(3, 'cm'))
+```
+
+```{r}
+plt_data <-  df %>%
+  filter(time_bin %in% c('sustained', 'post')) %>%
+  select(set_id, subject, region, time_bin, solution, zscore_blsub_mean) %>%
+  mutate(solution_magnitude = case_when(
+    solution %in% c('sucrose00', 'nacl150') ~ 'low',
+    solution %in% c('sucrose30', 'nacl000') ~ 'high'
+  )) %>%
+  filter(!is.na(solution_magnitude) ) %>%
+  select(-solution) %>%
+  spread(solution_magnitude, zscore_blsub_mean) %>%
+  mutate(range = high - low) 
+
+
+plt_range <- c(-5, 15)
+label_y <- 15
+
+
+plt_data %>%
+  select(set_id, time_bin, subject, region, range) %>%
+  spread(time_bin, range) %>%
+  ggplot(aes(sustained, post)) +
+  geom_abline(slope = 1, intercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_point(shape = 21, fill = 'black', color = 'white', stroke = 0.1) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5) +
+  stat_cor(method = "pearson", size = 2, label.y = 4, label.x = 0) +
+  theme_ag01() +
+  facet_grid(.~set_id) +
+  coord_cartesian(xlim = plt_range, ylim = c(-2.5, 5), expand = F) +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3, 'cm'))
+```
+
+### lick vs no lick
+#### trace - lick/nolick
+```{r}
+# for each set_id individually
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('full')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('full_peth_summary_trace_triallick')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df_lick <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]]
+
+plt_data_lick <- df_lick %>% 
+  filt_and_format_data() %>%
+  mutate(trial_lick = 
+           case_when(
+             trial_lick == 0 ~ 'no_lick',
+             trial_lick == 1 ~ 'lick'
+           ))
+
+
+# across all set_ids
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('full')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('full_peth_summary_trace_triallick')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df_lick_overall <- read.csv(str_c(dir_output, 'combined_main_set_id_lickvsnolick_peth_summary_trace_overall.csv'))
+
+plt_data_lick_overall <- df_lick_overall %>% 
+  filter(!region %>% str_detect('LHA')) %>%
+  mutate(region = region %>% factor(levels = unique(key_regions$region_label))) %>%
+  mutate(trial_lick = 
+           case_when(
+             trial_lick == 0 ~ 'no_lick',
+             trial_lick == 1 ~ 'lick'
+           ))
+```
+
+```{r, fig.width = 12, fig.height = 5}
+fn_stem <- 'fp_str_lickvnolick_setid_overall'
+
+plt <- plt_data_lick_overall %>%
+  #group_by(trial_lick, time_rel, region) %>%
+  #summarise(zscore_blsub_mean = mean(zscore_blsub_mean), zscore_blsub_sem = mean(zscore_blsub_sem)) %>%
+  filter(time_rel < 3, time_rel > -0.5) %>%
+  ggplot(aes(time_rel, zscore_blsub_mean, group = trial_lick, color = trial_lick, fill = trial_lick)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  geom_vline(xintercept = 0.3, color = 'darkgrey', size = 0.5, linetype = 2) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_ribbon(
+    aes(
+      ymin = zscore_blsub_mean - zscore_blsub_sem,
+      ymax
+      = zscore_blsub_mean + zscore_blsub_sem
+        ),
+    alpha = 1/3,
+    color = NA
+    ) +
+  geom_line() +
+  facet_grid(.~region) +
+  scale_color_manual(values = c('blue', 'black')) +
+  scale_fill_manual(values = c('blue', 'black')) +
+  theme_ag01() +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing.y = unit(0.5, "lines")) +
+  force_panelsizes(rows = unit(1, 'cm'), cols = unit(1.5, 'cm'))
+
+
+plt <- plt %>%
+  add_scale_bar(
+    origin = c(-0.5, -0.5), 
+    x_len = 1, 
+    y_len = 1
+  )
+
+plt
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+```
+
+
+
+```{r, fig.width = 12, fig.height = 5}
+fn_stem <- 'fp_str_lickvnolick_setid_trace'
+
+plt <- plt_data_lick %>%
+  #group_by(trial_lick, time_rel, region) %>%
+  #summarise(zscore_blsub_mean = mean(zscore_blsub_mean), zscore_blsub_sem = mean(zscore_blsub_sem)) %>%
+  filter(time_rel < 3, time_rel > -0.5) %>%
+  ggplot(aes(time_rel, zscore_blsub_mean, group = trial_lick, color = trial_lick, fill = trial_lick)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  geom_vline(xintercept = 0.3, color = 'darkgrey', size = 0.5, linetype = 2) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_ribbon(
+    aes(
+      ymin = zscore_blsub_mean - zscore_blsub_sem,
+      ymax
+      = zscore_blsub_mean + zscore_blsub_sem
+        ),
+    alpha = 1/3,
+    color = NA
+    ) +
+  geom_line() +
+  facet_grid(set_id~region) +
+  scale_color_manual(values = c('blue', 'black')) +
+  scale_fill_manual(values = c('blue', 'black')) +
+  theme_ag01() +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing.y = unit(0.5, "lines")) +
+  force_panelsizes(rows = unit(2, 'cm'), cols = unit(1.5, 'cm'))
+
+
+plt <- plt %>%
+  add_scale_bar(
+    origin = c(-0.5, -0.5), 
+    x_len = 1, 
+    y_len = 1
+  )
+
+plt
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+```
+
+
+#### summary - prelick
+```{r}
+
+# for each set_id individually
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('triallick')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('peth_summary_means_subject')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]] %>% 
+  filt_and_format_data() 
+
+plt_data <-  df %>%
+  filter(time_bin == 'prelick') %>%
+  select(set_id, subject, region, trial_lick, zscore_blsub_mean)
+
+
+# across all set_ids
+df <- read.csv(str_c(dir_output, 'combined_main_set_id_lickvsnolick_peth_summary_means_subject.csv')) 
+
+
+plt_data_summary <- df %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  mutate(region = region %>% factor(levels = unique(key_regions$region_label))) %>%
+  select(subject, region, time_bin, trial_lick, zscore_blsub_mean)
+```
+
+
+```{r}
+fn_stem <- 'fp_str_summary_lickvsnolick_prelick'
+
+plt_data <- plt_data_summary %>%
+  filter(time_bin == 'prelick') 
+
+plt_data %>%
+  mutate(trial_lick = ifelse(trial_lick == '0', '0', '≥1')) %>%
+  mutate(trial_lick = trial_lick %>% factor(levels = c('0', '≥1'))) %>%
+  ggplot(aes(trial_lick, zscore_blsub_mean)) +
+  geom_line(aes(group = interaction(region, subject)), alpha = 1/3, size = 1/4) +
+  geom_hline(yintercept = 0, size = 1/4, color = 'darkgrey') +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = 1)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = 1), width = 0) +
+  theme_ag01() +
+  #scale_x_continuous(breaks = c(0,1)) +
+  facet_grid(.~region, scales = 'free') +
+  coord_cartesian(xlim = c(0.5, 2.5), ylim = c(-1,3), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(1,'cm'), cols = unit(1.5, 'cm')) +
+  theme(strip.text.x = element_blank()) +
+  ylab('Z-score pre-lick (0.0-0.3 s)') +
+  xlab('')
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+```
+
+#### combined stats - prelick
+```{r}
+stats_data <- plt_data_summary %>%
+  filter(time_bin == 'prelick') 
+
+stats_results <- stats_data %>%
+   mutate(trial_lick = ifelse(trial_lick == 1, 'lick', 'nolick')) %>%
+   spread(trial_lick, zscore_blsub_mean) %>%
+   tidy_ttest_paired(NA, NA, 'lick', 'nolick', 'region') %>%
+   quick_sig()
+
+stats_results %>%
+  select(region, sig_symbol)
+
+stats_results %>% write_csv(str_c(dir_output_fp_str, 'fp_str_summary_lickvsnolick_prelick_stats.csv'))
+```
+
+
+#### range
+```{r}
+
+# for each set_id individually
+fns <- list.files(dir_output)
+fns_filt <- fns[fns %>% str_detect('triallick')]
+fns_filt <- fns_filt[fns_filt %>% str_detect('peth_summary_means_subject')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+
+df <- combined_import(import_directory = dir_output, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]] %>% 
+  filt_and_format_data() 
+
+plt_data <-  df %>%
+  filter(time_bin == 'prelick') %>%
+  select(set_id, subject, region, trial_lick, zscore_blsub_mean) %>%
+  spread(trial_lick, zscore_blsub_mean) %>%
+  mutate(range = `1` - `0`)
+
+
+# across all set_ids
+df <- read.csv(str_c(dir_output, 'combined_main_set_id_lickvsnolick_peth_summary_means_subject.csv')) %>%
+  filter(time_bin == 'prelick') 
+
+
+
+
+plt_data_summary <- df %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  mutate(region = region %>% factor(levels = unique(key_regions$region_label))) %>%
+  select(subject, region, trial_lick, zscore_blsub_mean) %>%
+  spread(trial_lick, zscore_blsub_mean) %>%
+  mutate(range = 
+           `1` - `0`)
+
+
+
+```
+
+
+```{r}
+fn_stem <- 'fp_str_summary_lickvsnolick_prelick_heat' 
+
+
+plt_data_summary <- plt_data %>%
+  group_by(set_id, region) %>%
+  summarise(range_mean = range %>% mean(na.rm = T), .groups = 'drop')
+
+plt_data_summary %>%
+  ggplot(aes(region, set_id, fill = range_mean)) +
+  geom_tile() +
+  scale_fill_viridis_c(limits = c(-0.2,1), oob = scales::squish) +
+  ylab('') +
+  xlab('') +
+  coord_cartesian(xlim = c(0.5, 7.5), ylim = c(0.5, 3.5), clip = 'off', expand = 0) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2.5, 'cm')) 
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 6, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+```
+
+
+
+### placement plots
+```{r}
+range_prelick <- read.csv('./analysis_output/peth_str/fp_str_summary_lickvsnolick_prelick_heat_data.csv') %>%
+  mutate(time_bin = 'prelick') %>%
+  select(set_id, subject, region, time_bin, range) 
+
+range_sustained <- read.csv('./analysis_output/peth_str/fp_str_range_sustained_heat_data.csv')%>%
+  mutate(time_bin = 'sustained') %>%
+  select(set_id, subject, region, time_bin, range) 
+
+range_post <- read.csv('./analysis_output/peth_str/fp_str_range_post_heat_data.csv')%>%
+  mutate(time_bin = 'post') %>%
+  select(set_id, subject, region, time_bin, range) 
+
+
+summary_range_combined <- range_prelick %>%
+  bind_rows(range_sustained) %>%
+  bind_rows(range_post)
+```
+
+
+
+```{r}
+fn_stem <- 'placement_vs_range'
+
+source('./functions/plotting_placements.R')
+
+modify_plt_corr <- function(plt, loop_time_bin){
+  plt <- plt +
+    theme(strip.text = element_blank()) 
+  
+    if(loop_time_bin == 'prelick'){
+      plt <- plt %>%
+        remove_x_all()
+    }
+  
+    if(loop_time_bin == 'sustained'){
+      plt <- plt %>%
+        remove_x_all()
+      }
+  
+  
+  return(plt)
+}
+
+set.seed(33)
+
+for(loop_set_id in c('WR:NaCl', 'FR:Suc', 'WR:Suc')){
+  for(loop_time_bin in c('prelick', 'sustained', 'post')){
+    
+    loop_set_label <- loop_set_id %>% str_remove(':')
+    fn_stem02 <-  str_c(fn_stem,'_', loop_set_label, '_', loop_time_bin)
+    
+    df <- summary_range_combined %>%
+      filter(set_id == loop_set_id) %>%
+      filter(time_bin == loop_time_bin) %>%
+      join_placements() %>%
+      select(set_id, subject, time_bin, region, range, starts_with('hit')) %>%
+      mutate(region = region %>% factor(levels = unique(key_regions$region_label))) %>%
+      filter(!is.na(range))
+    
+    
+    
+    var_color <- 'range'
+    
+    if(loop_time_bin == 'prelick'){color_limits <- c(-0.2,1)}
+    if(loop_time_bin == 'sustained'){color_limits <- c(-1,5)}
+    if(loop_time_bin == 'post'){color_limits <- c(-1,2)}
+
+    plt_str(
+      df = df,
+      var_color = !!sym(var_color),
+      var_color_name = 'Range',
+      vars_facet = c('.','.'),
+      plt_plane = 'sagittal',
+      plt_dim_base = 3,
+      color_limits = color_limits
+      )
+
+    save_pdf(str_c(dir_output_fp_str, 'placements/'), str_c(fn_stem02, '_sagittal.pdf'),6,6)
+
+    plt_str(
+      df = df,
+      var_color = !!sym(var_color),
+      var_color_name = 'Range',
+      vars_facet = c('.','.'),
+      plt_plane = 'horizontal',
+      plt_dim_base = 3,
+      color_limits = color_limits
+      )
+
+    save_pdf(str_c(dir_output_fp_str, 'placements/'), str_c(fn_stem02, '_horizontal.pdf'),6,6)
+
+    plt_str(
+      df = df,
+      var_color = !!sym(var_color),
+      var_color_name = 'Range',
+      vars_facet = c('.','.'),
+      plt_plane = 'coronal',
+      plt_dim_base = 3,
+      color_limits = color_limits
+      )
+
+    save_pdf(str_c(dir_output_fp_str, 'placements/'), str_c(fn_stem02, '_coronal.pdf'),6,6)
+
+    plt_str_3d(
+      df = df,
+      var_color = var_color,
+      color_limits = color_limits,
+      dir_output = str_c(dir_output_fp_str, 'placements/'),
+      fn_stem = str_c(fn_stem02),
+      toggle_save = 1
+      )
+    
+    # correlations
+    if(loop_time_bin == 'prelick'){ylim_all <- c(-2,3)}
+    if(loop_time_bin == 'sustained'){ylim_all <- c(-4,12)}
+    if(loop_time_bin == 'post'){ylim_all <- c(-2,4)}
+    
+    plt_list <- plt_corr_generic(
+      df = df, 
+      ylim_all = ylim_all, 
+      xlim_ap = c(-3, 0, 3),
+      xlim_ml = c(0, 2, 4),
+      xlim_dv = c(-6, -4, -2),
+      var_dep = var_color, 
+      var_dep_label = 'Range', 
+      plt_dims = c(2.5, 2.5)
+    )
+    
+    
+    plt_list[['stats_output']] 
+    
+    # run pearsons
+    plt_list[['AP']] %>% modify_plt_corr(loop_time_bin) +
+      plt_list[['ML']] %>% modify_plt_corr(loop_time_bin) + 
+      plt_list[['DV']] %>% modify_plt_corr(loop_time_bin) +
+      plot_layout(nrow = 1, widths = unit(3, 'cm'), heights = unit(3, 'cm'), guides = 'collect')
+    
+    save_pdf(
+      str_c(dir_output_fp_str, 'placements/'),
+      str_c(fn_stem02, '_corr', '.pdf'),
+      12, 
+      6
+    )
+    
+    df %>%
+      write_csv(str_c(dir_output_fp_str, 'placements/', fn_stem02, '_corr_data.csv'))
+    
+    plt_list[['stats_output']]  %>%
+      write_csv(str_c(dir_output_fp_str, 'placements/', fn_stem02, '_corr_stats.csv'))
+  
+  }
+}
+``` 
+
+#### colored by fiber locaiton
+```{r}
+dir_output <- dir_output_fp_str
+fn_stem <- 'placement_generic'
+
+plt_data <- summary_range_combined %>%
+    select(subject, region) %>%
+    unique() %>%
+    join_placements() %>%
+    select(subject, region, starts_with('hit')) %>%
+    mutate(region = region %>% factor(levels = unique(key_regions$region_label)))
+
+
+plt_data %>%
+  group_by(region) %>%
+  summarise(count = n())
+```
+
+
+```{r}
+df <- plt_data
+
+var_color <- 'region'
+var_color_name <- 'Region'
+color_limits <- c(0,0.8)
+
+plt_str_d(
+  df = df, 
+  var_color = !!sym(var_color),
+  var_color_name = var_color_name,
+  vars_facet = c('.','.'),
+  plt_plane = 'sagittal',
+  plt_dim_base = 3,
+  color_values = color_values_regions_da7
+  )
+
+save_pdf(str_c(dir_output, 'placements/'), str_c(fn_stem, '_sagittal.pdf'),6,6)
+
+plt_str_d(
+  df = df,
+  var_color = !!sym(var_color),
+  var_color_name = var_color_name,
+  vars_facet = c('.','.'),
+  plt_plane = 'horizontal',
+  plt_dim_base = 3,
+  color_values = color_values_regions_da7
+  ) 
+
+save_pdf(str_c(dir_output, 'placements/'), str_c(fn_stem, '_horizontal.pdf'),6,6)
+
+plt_str_d(
+  df = df,
+  var_color = !!sym(var_color),
+  var_color_name = var_color_name,
+  vars_facet = c('.','.'),
+  plt_plane = 'coronal',
+  plt_dim_base = 3,
+  color_values = color_values_regions_da7
+  ) 
+
+save_pdf(str_c(dir_output, 'placements/'), str_c(fn_stem, '_coronal.pdf'),6,6)
+
+df_3d <- df %>%
+  select(region) %>%
+  unique() %>%
+  arrange(region) %>%
+  mutate(color_value = color_values_regions_da7) %>%
+  left_join(df,.)
+
+plt_str_3d_d(
+  df = df_3d, 
+  var_color = var_color, 
+  color_values = 'color_value',
+  dir_output = str_c(dir_output, 'placements/'),
+  fn_stem = str_c(fn_stem),
+  toggle_save = 1
+  )
+
+```
+
+
+### corr lick vs resp
+```{r}
+dir_import <- './data/combined_setid/'
+
+fns <- list.files(dir_import)
+fns_filt <- fns[fns %>% str_detect('filtlick_peth_summary_means_trial')]
+fns_filt <- fns_filt %>% str_remove('.csv')
+
+df <- combined_import(import_directory = dir_import, 
+                filter_strings = fns_filt,
+                prefixes = NA,
+                suffixes = c('.csv'),
+                verbose = 0
+                )[[1]] %>% 
+  filt_and_format_data() %>%
+  filter(time_bin == 'sustained')
+```
+
+
+```{r, fig.width = 18, fig.height = 6}
+
+fn_stem <- 'fp_str_cor_zscore_vs_lick'
+
+
+df_plt <- df %>%
+  filter(time_bin == 'sustained') 
+
+df %>%
+  filter(time_bin == 'sustained') %>%
+  ggplot(aes(zscore_blsub_mean, lick_count)) +
+  geom_jitter(size = 0.1, alpha = 1/8) +
+  geom_smooth(method = 'lm', size = 0.3, alpha = 1/5, color = 'black') +
+  stat_cor(method = "pearson", label.y = 29, label.x = -8, size = 2) +
+  facet_grid(set_id~region) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(-10,20), ylim = c(0,30), expand = F, clip = 'on') +
+  scale_x_continuous(breaks = seq(-10,20,10)) +
+  theme(strip.text = element_text(margin = margin(t = 5, r = 5, b = 5, l = 5))) +
+  theme(panel.spacing = unit(1, "lines")) +
+  ylab('Lick count') +
+  xlab('Z-score sustained (2-3s)') +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2, 'cm'))
+
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 12, 6)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+```
+
+```{r}
+corr_sbj <- df %>%
+  filter(time_bin == 'sustained') %>%
+  tidy_cor('zscore_blsub_mean', 'lick_count', 'subject', 'region', 'set_id') %>%
+  mutate(estimate_squared = estimate^2) %>% 
+  ungroup()
+
+
+fn_stem <- 'fp_str_cor_zscore_vs_lick_subject_summary_combined' #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+corr_sbj %>%
+  ggplot(aes(set_id, estimate_squared, fill = region, color = region)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', position = position_dodge(width = 0.9), width = 0.4) +
+  stat_summary(fun = 'mean', geom = 'col', position = position_dodge(width = 0.9), width = 0.75) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.3, dodge.width = 0.9), shape = 21, color = 'white', stroke = 0.25, size = 2) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_regions_da7) +
+  scale_fill_manual(values = color_values_regions_da7) +
+  ylab('R^2') +
+  xlab('') +
+  coord_cartesian(xlim = c(0.5, 3.5), ylim = c(0, 1), clip = 'off', expand = 0) +
+  force_panelsizes(rows = unit(3,'cm'), cols = unit(12, 'cm')) 
+
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 8, 4)
+
+corr_sbj %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+stats_list <- corr_sbj %>%
+  mutate(subject = str_c(subject, row_number())) %>%
+  aov_rm_two_between(dir_output_fp_str,fn_stem,'subject','estimate_squared', 'region', 'set_id')
+```
+
+
+```{r}
+stats_list[[3]] %>%
+  filter(contrast1_between2 == contrast2_between2) %>%
+  select(contrast1_between2, contrast1_between1, contrast2_between1, p_value, sig_symbol) %>%
+  filter(sig_symbol != 'n.s.')
+
+
+stats_list[[3]] %>%
+  filter(contrast1_between1 == contrast2_between1) %>%
+  select(contrast1_between2, contrast2_between2, contrast1_between1, p_value, sig_symbol) %>%
+  filter(sig_symbol != 'n.s.')
+```
+
+### lick count binned vs solution heat
+```{r, fig.width = 12, fig.height = 4}
+fn_stem <- 'fp_str_solution_vs_lickcountbinned_heat' 
+
+plt_data <- df %>%
+  select(subject, region, set_id, trial_num, solution, lick_count, zscore_blsub_mean) %>%
+  mutate(lick_count_bin = cut(lick_count, seq(0,25,5))) %>%
+  group_by(set_id, region, subject, solution, lick_count_bin) %>%
+  summarise(zscore_blsub_mean = zscore_blsub_mean %>% mean(),
+            sample_count_per_subject = n()) %>%
+  filter(sample_count_per_subject >= 3) %>%
+  group_by(set_id, region, solution, lick_count_bin) %>%
+  summarise(zscore_blsub_mean = zscore_blsub_mean %>% mean(), .groups = 'drop') %>%
+  left_join(join_solution_x)
+
+
+plt_data %>%
+  filter(!is.na(lick_count_bin)) %>%
+  ggplot(aes(plt_x, lick_count_bin, fill = zscore_blsub_mean)) +
+  geom_tile() +
+  facet_grid(set_id~region) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(0.5,5.5), ylim = c(0.5, 5.5), expand = F) +
+  scale_fill_viridis_c(limits = c(-1,4), oob = scales::squish) +
+  force_panelsizes(rows = unit(2,'cm'), cols = unit(2, 'cm')) +
+  ylab('Binned lick count') +
+  xlab('Solution value (rank)')
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 8, 4)
+
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+```
+
+
+### kinetics
+```{r}
+# todo:
+#  - loop over set_id
+#  - define solutions of intereste with vector
+#  - replace zscore_blsub with vardv
+#  - derive streams_peth_solution_derivative in get_kinetics
+
+dir_output <- "./analysis_output/peth_str/"
+
+df_peth <- read.csv('./data/combined_setid/wrnacl_filtlick_peth_summary_trace_overall.csv')
+df_derivative <- read.csv('./data/combined_setid/wrnacl_filtlick_pethkinetics_summary_trace_subject.csv')
+
+df_kinetic_summary_trial <- read.csv('./data/combined_setid/wrnacl_filtlick_pethkinetics_summary_means_trial.csv')
+df_kinetic_summary_subject_region_solution <- read.csv('./data/combined_setid/wrnacl_filtlick_pethkinetics_summary_means_subject.csv')
+
+df_peth <- df_peth %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  mutate(region = region %>% factor(levels = key_regions$region_label %>% unique()))
+
+df_derivative <- df_derivative %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  mutate(region = region %>% factor(levels = key_regions$region_label %>% unique()))
+
+df_kinetic_summary_subject_region_solution <- df_kinetic_summary_subject_region_solution %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  mutate(region = region %>% factor(levels = key_regions$region_label %>% unique()))
+
+# nacl000 only
+plt_data_kinetics <- df_kinetic_summary_subject_region_solution %>%
+  filter(solution == 'nacl000') %>%
+  select(-solution) %>%
+  group_by(subject, region) %>%
+  summarise_all(mean)
+
+plt_summary_kineticsv02(
+  plt_data_kinetics = plt_data_kinetics, 
+  fn_stem_set = 'kinetics_nacl000', 
+  dir_output_fp_str
+  )
+
+# duplicate files into dir_output_fp_str
+source_folder <- "./data/combined_setid/kinetics_nacl000/"
+destination_folder <- dir_output_fp_str
+
+
+```
+
+
+```{r}
+plt <- df_derivative %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  group_by(region, solution, time_rel) %>%
+  filter(solution == 'nacl000') %>%
+  filter(time_rel > -1, time_rel < 3) %>%
+  ggplot(aes(time_rel, derivative_mean, color = region,  fill = region)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  geom_ribbon(aes(ymax = derivative_mean + derivative_sem, ymin = derivative_mean - derivative_sem), alpha = 1/3, color = NA) +
+  geom_line() +
+  scale_color_manual(values = color_values_regions_da7) +
+  scale_fill_manual(values = color_values_regions_da7) +
+  theme_ag01() +
+  force_panelsizes(rows = unit(4, 'cm'), cols = unit(11, 'cm')) +
+  ggtitle('WR:NaCl / water')
+
+
+
+plt %>%
+  add_scale_bar(
+    origin = c(-1, -0.1), 
+    x_len = 1, 
+    y_len = 0.25
+  )
+
+save_pdf(dir_output_fp_str, 'kinetics_nacl000_trace_derivative.pdf',6,4)
+```
+
+
+```{r}
+plt <- df_peth %>%
+  filter(!region %>% str_detect('LHA')) %>%
+  group_by(region, solution, time_rel) %>%
+  filter(solution == 'nacl000') %>%
+  filter(time_rel > -1, time_rel < 3) %>%
+  ggplot(aes(time_rel, zscore_blsub_mean, color = region,  fill = region)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  geom_ribbon(aes(ymax = zscore_blsub_mean + zscore_blsub_sem, ymin = zscore_blsub_mean - zscore_blsub_sem), alpha = 1/3, color = NA) +
+  geom_line() +
+  scale_color_manual(values = color_values_regions_da7) +
+  scale_fill_manual(values = color_values_regions_da7) +
+  theme_ag01() +
+  force_panelsizes(rows = unit(4, 'cm'), cols = unit(11, 'cm')) +
+  ggtitle('WR:NaCl / water')
+
+plt %>%
+  add_scale_bar(
+    origin = c(-1, -0.2), 
+    x_len = 1, 
+    y_len = 1
+  )
+
+save_pdf(dir_output_fp_str, 'kinetics_nacl000_trace_raw.pdf',6,4)
+```
+
+
+## str correlation
+```{r}
+# read in data
+dir_output_fp_str_cor <- './analysis_output/peth_str_cor/'
+
+## baseline
+fns_streams_bl_corr <- list.files(dir_sessions_combined_subject, pattern = 'streams_baseline_corr.csv', recursive = T, full.names = T)
+
+streams_bl_corr <- bind_rows(lapply(fns_streams_bl_corr, read.csv)) %>%
+  filter(set_id %in% c('wrnacl', 'wrsuc', 'frsuc')) %>%
+  format_set_id(key_set_id) %>%
+  mutate(
+    var_x = var_x %>% factor(levels = key_regions$region_label %>% unique()),
+    var_y = var_y %>% factor(levels = key_regions$region_label %>% unique())
+    )
+
+## peth time_rel
+fns_streams_peth_corr_timerel <- list.files(dir_sessions_combined_subject, pattern = 'streams_peth_corr_timerel.csv', recursive = T, full.names = T)
+
+streams_peth_corr_timerel <- bind_rows(lapply(fns_streams_peth_corr_timerel, read.csv)) %>%
+  filter(set_id %in% c('wrnacl', 'wrsuc', 'frsuc')) %>%
+  format_set_id(key_set_id) %>%
+  mutate(
+    var_x = var_x %>% factor(levels = key_regions$region_label %>% unique()),
+    var_y = var_y %>% factor(levels = key_regions$region_label %>% unique())
+    )
+
+
+## peth time_rel
+fns_streams_peth_corr_windows <- list.files(dir_sessions_combined_subject, pattern = 'streams_peth_corr_windows.csv', recursive = T, full.names = T)
+
+streams_peth_corr_windows <- bind_rows(lapply(fns_streams_peth_corr_windows, read.csv)) %>%
+  filter(set_id %in% c('wrnacl', 'wrsuc', 'frsuc')) %>%
+  format_set_id(key_set_id) %>%
+  mutate(
+    var_x = var_x %>% factor(levels = key_regions$region_label %>% unique()),
+    var_y = var_y %>% factor(levels = key_regions$region_label %>% unique())
+    )
+
+
+```
+
+### baseline correlation across homeostatic demand
+```{r}
+fn_stem <- 'cor_baseline_setid'
+
+plt_data_subject <- streams_bl_corr %>%
+  mutate(set_id = set_id %>% factor(levels = c('FR:Suc', 'WR:Suc', 'WR:NaCl'))) %>%
+  group_by(set_id, subject, var_x, var_y) %>%
+  filter(var_x != var_y) %>%
+  summarise(r = mean(r), .groups = 'drop') %>%
+  group_by(set_id, subject) %>%
+  summarise(r = mean(r), .groups = 'drop')
+
+plt_data_summary <- streams_bl_corr %>%
+  mutate(set_id = set_id %>% factor(levels = c('FR:Suc', 'WR:Suc', 'WR:NaCl'))) %>%
+  group_by(set_id, var_x, var_y) %>%
+  summarise(r = mean(r))
+
+plt_corrmatrix(plt_data_summary) +
+  facet_grid(.~set_id) +
+  ggtitle('Baseline correlation \n') +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3, 'cm'))
+
+save_pdf(dir_output_fp_str_cor, str_c(fn_stem, '_heat', '.pdf'), 6, 4)
+
+
+plt_data_subject %>%
+  ggplot(aes(set_id, r, group = 1)) +
+  geom_line(aes(group = subject), alpha = 1/3, size = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line') +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  theme_ag01() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  coord_cartesian(xlim = c(0.5, 3.5), ylim = c(0, 0.8), expand = F) +
+  #scale_y_continuous(breaks = seq(0,0.6,0.2)) +
+  xlab('') +
+  ylab('Mean R') +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3.3512, 'cm'))
+
+save_pdf(dir_output_fp_str_cor, str_c(fn_stem, '_summary', '.pdf'), 6, 4)
+
+plt_data_subject %>%
+  aov_rm_one_within(dir_output_fp_str_cor,str_c(fn_stem,'_summary'),'subject','r','set_id')
+
+```
+
+
+```{r}
+fn_stem <- 'cor_peth_setid'
+
+plt_data_summary <- streams_peth_corr_windows %>%
+  mutate(set_id = set_id %>% factor(levels = c('FR:Suc', 'WR:Suc', 'WR:NaCl'))) %>%
+  mutate(time_rel_bin = factor(time_rel_bin, levels = c('Pre', 'Sustained', 'Post'))) 
+
+
+plt_data_subject <- streams_peth_corr_windows %>%
+  mutate(set_id = set_id %>% factor(levels = c('FR:Suc', 'WR:Suc', 'WR:NaCl'))) %>%
+  mutate(time_rel_bin = factor(time_rel_bin, levels = c('Pre', 'Sustained', 'Post'))) %>%
+  filter(var_x != var_y) %>%
+  group_by(subject, set_id, time_rel_bin, var_x, var_y) %>%
+  summarise(r = mean(r)) %>%
+  group_by(subject, set_id, time_rel_bin) %>%
+  summarise(r = mean(r), .groups = 'drop') 
+
+
+plt_corrmatrix(plt_data_summary) +
+  facet_grid(time_rel_bin~set_id) +
+  ggtitle('Consumption correlation \n') +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3, 'cm'))
+
+save_pdf(dir_output_fp_str_cor, str_c(fn_stem, '_heat', '.pdf'), 6, 6)
+
+plt_data_subject %>%
+  ggplot(aes(time_rel_bin, r, group = 1)) +
+  geom_line(aes(group = subject), alpha = 1/3, size = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line') +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  theme_ag01() +
+  facet_grid(.~set_id) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  coord_cartesian(xlim = c(0.25, 3.25), ylim = c(0, 1), expand = F) +
+  scale_y_continuous(breaks = seq(0,1,0.25)) +
+  xlab('') +
+  ylab('Mean R') +
+  force_panelsizes(rows = unit(4, 'cm'), cols = unit(1, 'cm'))
+
+save_pdf(dir_output_fp_str_cor, str_c(fn_stem, '_summary', '.pdf'), 6, 4)
+
+stats_list <- plt_data_subject %>%
+  aov_rm_two_within(dir_output_fp_str_cor,str_c(fn_stem,'_summary'),'subject','r','set_id', 'time_rel_bin')
+
+stats_list[[3]] %>%
+  filter(contrast1_within1 == contrast2_within1) %>%
+  filter(sig_symbol != 'n.s.') %>%
+  ggplot(aes(contrast1_within2, contrast2_within2, label = sig_symbol)) +
+  geom_text() +
+  facet_grid(.~contrast1_within1)
+
+stats_list[[3]] %>%
+  filter(contrast1_within2 == contrast2_within2)
+```
+
+
+```{r}
+plt_data <- streams_peth_corr_timerel %>%
+  filter(var_x != var_y) %>%
+  group_by(subject, set_id, time_rel) %>%
+  summarise(r = mean(r)) 
+
+plt_data %>%
+  ggplot(aes(time_rel, r, color = set_id, fill = set_id, group = set_id)) +
+  geom_hline(yintercept = c(0.2, 0.4, 0.6), color = 'darkgrey', size = 1/3) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  stat_summary(fun.data = 'mean_se', geom = 'ribbon', color = NA, alpha = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line') +
+  scale_color_manual(values = color_values_experiment_set) +
+  scale_fill_manual(values = color_values_experiment_set) +
+  theme_ag01() +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3.3512, 'cm')) +
+  coord_cartesian(xlim = c(-3,9), ylim = c(0, 0.6), expand = F) +
+  scale_y_continuous(breaks = seq(0,0.6,0.2)) +
+  ylab('Mean R') +
+  xlab('Time (s)')
+
+save_pdf(dir_output_fp_str_cor, str_c(fn_stem, '_trace', '.pdf'), 6, 4)
+plt_data %>% write_csv(str_c(dir_output_fp_str_cor, fn_stem, '_trace_data.csv'))
+```
+
+
+```{r}
+fn_stem <- 'cor_peth_pairwise_ecdf'
+
+plt_data <- streams_peth_corr_windows %>%
+  filter(var_x != var_y) %>%
+  mutate(set_id = set_id %>% factor(levels = c('FR:Suc', 'WR:Suc', 'WR:NaCl'))) %>%
+  mutate(time_rel_bin = factor(time_rel_bin, levels = c('Pre', 'Sustained', 'Post'))) %>%
+  filter(time_rel_bin == 'Sustained')
+
+
+regions <- unique(plt_data$var_x)
+
+for(region in regions){
+  loop_df <- plt_data %>%
+    filter(var_x == region | var_y == region) %>%
+    mutate(pairwise_region01 = region) %>%
+    mutate(pairwise_region02 = case_when(
+      var_x == region ~ var_y,
+      var_y == region ~ var_x
+    )
+    ) %>%
+    select(-var_x, -var_y)
+  
+  if(region == regions[1]){
+    cor_pairwise <- loop_df
+  } else {
+    cor_pairwise <- loop_df %>%
+      bind_rows(cor_pairwise,.)
+  }
+}
+
+cor_pairwise <- cor_pairwise %>%
+  group_by(subject, pairwise_region01, pairwise_region02) %>%
+  summarise(r = mean(r), .groups = 'drop') %>%
+  mutate(pairwise_region01 = pairwise_region01 %>% factor(levels = key_regions$region_label %>% unique()))
+
+
+cor_pairwise %>%
+  ggplot(aes(r, color = pairwise_region01)) +
+  geom_vline(xintercept = 0, color = 'darkgrey', size = 1/3) +
+  stat_ecdf() +
+  theme_ag01() +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3, 'cm')) +
+  coord_cartesian(xlim = c(-1,1), ylim = c(0, 1), expand = F, clip = 'off') +
+  scale_color_manual(values = color_values_regions_da) +
+  theme(panel.spacing = unit(1.5, "lines")) +
+  theme(strip.text = element_text(margin = margin(b = 5))) +
+  xlab('Pairwise R') +
+  ylab('Proportion')
+
+cor_pairwise %>% write_csv(str_c(dir_output_fp_str_cor, fn_stem, '_data.csv'))
+save_pdf(dir_output_fp_str_cor, str_c(fn_stem, '.pdf'), 6, 4)
+```
+
+
+```{r}
+fn_stem <- 'cor_peth_sustaind_pairwisecor'
+
+plt_data_summary <- cor_pairwise %>%
+  group_by(subject, pairwise_region01) %>%
+  summarise(r = mean(r), .groups = 'drop') 
+
+plt_line <- plt_data_summary %>%
+  ggplot(aes(pairwise_region01, r, group = 1)) +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 1/3) +
+  geom_line(aes(group = subject), size = 1/2, alpha = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line') +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', width = 0) +
+  theme_ag01() +
+  force_panelsizes(rows = unit(3, 'cm'), cols = unit(3, 'cm')) +
+  coord_cartesian(xlim = c(0.5,6.5), ylim = c(-.25, 1), expand = F, clip = 'off') +
+  scale_color_manual(values = color_values_regions_da) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  xlab('Pairwise Region') +
+  ylab('Pairwise R')
+
+
+stats_list <- plt_data_summary %>%
+  aov_rm_one_within(dir_output_fp_str_cor, fn_stem,'subject','r','pairwise_region01') 
+  
+
+
+plt_pairwise <- plt_line_pairwise(
+      df = plt_data_summary %>% left_join(key_regions %>% rename(pairwise_region01 = region_label)), 
+      dir_output = dir_output_fp_str_cor,
+      fn_stem = fn_stem,
+      var_dv = 'r',
+      var_within = 'region' ,
+      ylims = c(-1, 1)
+    )
+
+
+plt_line + plt_pairwise[[3]] +
+    plot_layout(ncol = 2, widths = unit(3, 'cm'), heights = unit(3, 'cm')) 
+
+
+cor_pairwise %>% write_csv(str_c(dir_output_fp_str_cor, fn_stem, '_data.csv'))
+save_pdf(dir_output_fp_str_cor, str_c(fn_stem, '.pdf'), 6, 4)
+
+
+cor_pairwise %>%
+  select(subject) %>%
+  unique()
+```
+
+
+## rep subject
+```{r}
+rep_subject <- 'acd01'
+```
+
+rango
+
+```{r}
+# setup import blocknames
+process_blocknames <- log_data %>%
+  filter(subject == rep_subject) %>%
+  filter(set_id %in% c('frsuc', 'wrnacl', 'wrsuc')) %>%
+  pull(blockname)
+
+# import peth and join in subject id
+df_fp_peth_rep <- combine_session_fp(process_blocknames, dir_localdata_sessions) %>%
+  left_join(log_analysis_fp %>% select(blockname, subject), by = 'blockname') %>%
+  left_join(log_data %>% select(blockname, set_id), by = 'blockname')
+
+
+df_fp_peth_rep <- df_fp_peth_rep %>%
+  filter(trial_lick == 1) %>%
+  format_regions('region', key_regions)
+```
+
+
+```{r}
+join_trial_num_solution <- df_fp_peth_rep %>%
+  filter(time_rel == 0) %>%
+  select(blockname, set_id, trial_num, solution) %>%
+  unique() %>%
+  arrange(solution, set_id, trial_num) %>%
+  group_by(set_id, solution) %>%
+  mutate(trial_num_solution = row_number()) 
+
+
+join_trial_num_global <- df_fp_peth_rep %>%
+  filter(time_rel > 0, time_rel <= 3) %>%
+  group_by(blockname, set_id, solution, trial_num) %>%
+  summarise(zscore_blsub_global = zscore_blsub %>% mean(), .groups = 'drop') %>%
+  group_by(set_id, solution) %>%
+  arrange(set_id, solution, zscore_blsub_global) %>%
+  mutate(trial_num_global = row_number())
+  
+```
+
+```{r, fig.width = 12, fig.height = 6}
+fn_stem <- 'fp_strrepsbj_heat'
+
+plt_data <- df_fp_peth_rep %>%
+  left_join(join_trial_num_global) %>%
+  filter(time_rel > -3, time_rel <= 12) %>%
+  filter(set_id == 'wrnacl') 
+
+plt_data %>%
+  ggplot(aes(time_rel, trial_num_global, fill = zscore_blsub)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = 'inferno', limits = c(-5,8), oob = scales::squish) +
+  facet_grid(solution~region) +
+  geom_vline(xintercept = c(0, 3), color = 'white', linewidth = 1/4) +
+  theme_ag01() +
+  coord_cartesian(xlim = c(-3, 12), ylim = c(0, 80), expand = F) +
+  force_panelsizes(rows = unit(1.5, 'cm'), cols = unit(2.5, 'cm'))
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 9, 4)
+plt_data %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+```
+
+```{r, fig.width = 12, fig.height = 6}
+fn_stem <- 'fp_strrepsbj_trace'
+
+df_fp_peth_rep_summary <- df_fp_peth_rep %>%
+  left_join(join_trial_num_solution) %>%
+  filter(time_rel > -3, time_rel <= 12) %>%
+  filter(set_id == 'wrnacl') %>%
+  group_by(set_id, region, solution, time_rel) %>%
+  summarise(
+    zscore_blsub_sem = sd(zscore_blsub) / sqrt(n()),
+    zscore_blsub = zscore_blsub %>% mean()
+    )
+
+plt <- df_fp_peth_rep_summary %>%
+  ggplot(aes(time_rel, zscore_blsub, color = solution, fill = solution)) +
+  annotate("rect", xmin = 0, xmax = 3, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "darkgrey") +
+  geom_hline(yintercept = 0, color = 'darkgrey', size = 0.5) +
+  geom_ribbon(aes(ymax = zscore_blsub + zscore_blsub_sem, ymin = zscore_blsub - zscore_blsub_sem), alpha = 1/3, color = NA) +
+  geom_line() +
+  facet_grid(.~region) +
+  theme_ag01() +
+  scale_color_manual(values = color_values_nacl) +
+  scale_fill_manual(values = color_values_nacl) +
+  force_panelsizes(rows = unit(2.5, 'cm'), cols = unit(2.5, 'cm'))
+
+plt <- plt %>%
+  add_scale_bar(
+    origin = c(-3, -1), 
+    x_len = 1, 
+    y_len = 1
+  )
+
+plt 
+
+save_pdf(dir_output_fp_str, str_c(fn_stem, '.pdf'), 9, 4)
+df_fp_peth_rep_summary %>% write_csv(str_c(dir_output_fp_str, fn_stem, '_data.csv'))
+
+```
+
+
+
+

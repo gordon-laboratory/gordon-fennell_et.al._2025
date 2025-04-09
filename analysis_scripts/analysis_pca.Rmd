@@ -1,0 +1,102 @@
+---
+title: "compiler"
+author: "adam gordon-fennell"
+date: '2023-12-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# libraries
+```{r}
+library(corrr)
+library(ggcorrplot)
+library(FactoMineR)
+library(factoextra)
+```
+
+
+# pca
+```{r}
+subjects_pca_da <- log_analysis_subjects %>%
+  filter(inclusion_6site == 1) %>%
+  pull(subject)
+```
+
+```{r}
+# setup import blocknames
+process_blocknames <- log_analysis_fp %>%
+  filter(subject %in% subjects_pca_da) %>%
+  filter(is.na(exclude)) %>%
+  filter(last04 == 1) %>%
+  get_set_id() %>%
+  filter(set_id %in% c('wrnacl', 'wrsuc', 'frsuc')) %>%
+  pull(blockname)
+
+# import peth
+df_fp_peth <- combine_session_fp(process_blocknames, dir_localdata_sessions)
+
+df_temp <- df_fp_peth %>% filter(time_rel > -3, time_rel < 11)
+```
+
+
+```{r}
+# filter df_temp for pca analysis (subjects, set_id)
+
+cat_vars <- c('set_id', 'subject', 'blockname', 'trial_num', 'solution', 'lick_count', 'time', 'time_rel')
+
+
+df_pca <- df_temp %>%
+  left_join(log_analysis_fp %>% select(blockname, subject)) %>%
+  filter(subject %in% subjects_pca_da)%>%  # filter subjects
+  left_join(log_analysis_fp %>% select(blockname, procedure, deprivation), by = join_by(blockname)) %>%
+  get_set_id() %>%
+  #filter(set_id == 'wrnacl') %>% # filter set_id
+  select(all_of(cat_vars), region, zscore_blsub)
+```
+
+
+```{r}
+# filter out sessions with poor signal qulaity
+fns_qc_metrics <- list.files(dir_localdata_sessions, pattern = 'quality_metrics.csv', recursive = T, full.names = T)
+combined_qc_metrics <- bind_rows(lapply(fns_qc_metrics, read.csv))
+
+blocknames_to_remove <- df_pca %>%
+  filter(time_rel == 0) %>%
+  select(subject, blockname, region) %>% 
+  unique() %>%
+  left_join(combined_qc_metrics %>% select(blockname, region, exclude_poor_signal), by = c('blockname', 'region')) %>%
+  filter(exclude_poor_signal != 0) %>% # is.na for lha ratio
+  select(-exclude_poor_signal) %>%
+  pull(blockname)
+
+
+df_pca <- df_pca %>%
+  filter(!blockname %in% blocknames_to_remove)
+```
+
+
+```{r}
+#make wide df and filter to trials with licking
+df_pca_wide <- df_pca %>%
+  spread(region, zscore_blsub) %>%
+  filter(lick_count > 0)
+
+sig_vars <- colnames(df_pca_wide)
+sig_vars <- sig_vars[!sig_vars %in% cat_vars]
+```
+
+
+```{r}
+# select numeric data only
+df_pca_wide_numeric <- df_pca_wide %>%
+  select(-all_of(cat_vars))
+
+# run pca
+pca_results <- princomp(df_pca_wide_numeric)
+
+# return summary 
+pca_summary <- pca_results %>% tidy_pca_summary()
+```

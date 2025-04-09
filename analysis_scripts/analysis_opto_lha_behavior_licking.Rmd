@@ -1,0 +1,394 @@
+---
+title: "Untitled"
+author: "adam gordon-fennell"
+date: "2024-10-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# packages
+```{r}
+library(tidyverse)
+library(afex)
+library(emmeans)
+library(janitor)
+library(ggpubr) #r2 on correlation
+library(readxl)
+library(googlesheets4)
+library(ggh4x) # force_panelsizes
+library(arrow)
+library(zoo)
+library(lubridate)
+library(patchwork)
+library(ggbeeswarm)
+library(pals)
+library(plotly)
+library(ggpubr) #r2 on correlation
+
+source('./functions/r_plots.R')
+source('./functions/r_stats.R')
+source('./functions/r_general.R')
+source('./functions/r_fp.R')
+source('./functions/r_head_fixed_processing.R')
+
+```
+
+
+# setup
+```{r}
+plt_dims <- c(3,3)
+```
+
+
+# functions
+
+```{r}
+aov_rm_one_between_two_within <- function(df, dir_output, prefix, var_id, var_dependent, var_between, var_within1, var_within2){
+  require(afex)
+
+  anova_model <- aov_ez(
+    id = var_id,
+    dv = var_dependent,
+    data = df,
+    between = c(var_between),
+    within = c(var_within1, var_within2),
+    anova_table=list(correction="none", es = "none"))
+
+    label_anova <- c("intercept",
+                   var_between,
+                   var_within1,
+                   var_within2,
+                   str_c(var_between, '*', var_within1),
+                   str_c(var_between, '*', var_within2),
+                   str_c(var_within1, '*', var_within2),
+                   str_c(var_between, '*', var_within1, '*', var_within2)
+                   ) %>%
+    as_tibble()
+
+    anova_summary <-  summary(anova_model)[[4]][] %>%
+                    as_tibble() %>%
+                    bind_cols(label_anova,.) %>%
+                    rename("effect" = "value",
+                           "ss" = "Sum Sq",
+                           "df_num" = "num Df",
+                           "ss_error" = "Error SS",
+                           "df_den" = "den Df",
+                           "f" = "F value",
+                           "p_value" = "Pr(>F)")
+
+
+  anova_summary <- anova_summary %>%
+    mutate(stat = 'aov_rm_three_within',
+           var_dv   = var_dependent,
+           var_id   = var_id,
+           var_between = var_between,
+           var_within1 = var_within1
+    ) %>%
+    select(stat, var_dv, everything()) %>%
+    quick_sig()
+
+    interaction <- paste("~", var_between, '*', var_within1, '*', var_within2, sep = "")
+
+    emm <- emmeans(anova_model, formula(interaction))
+
+    pairs_hsd <- pairs(emm) %>%
+      as_tibble() %>%
+      separate(contrast, into = c('contrast1', 'contrast2'), sep = '-') %>%
+      mutate_if(is.character, str_trim) %>%
+      separate(contrast1, into = c('contrast1_between', 'contrast1_within1', 'contrast1_within2'), sep = ' ') %>%
+      separate(contrast2, into = c('contrast2_between', 'contrast2_within1', 'contrast2_within2'), sep = ' ') %>%
+      mutate_if(is.character, str_trim) %>%
+      rename('p_value' = 'p.value',
+             't_ratio' = 't.ratio')  %>%
+    quick_sig()
+
+  save_aov(dir_output, prefix, anova_summary, pairs_hsd, df)
+
+  return(list(anova_model, anova_summary, pairs_hsd))
+
+}
+
+format_vars <- function(df){
+  df %>%
+    mutate(
+      stim_id = case_when(
+        stim_id == 'lha' ~ 'Stim',
+        stim_id == 'no_stim' ~ 'No stim'
+        )
+    ) %>%
+    mutate(
+      solution = case_when(
+        solution == 'water' ~ 'Water',
+        solution == 'nacl100' ~ '1M NaCl'
+        )
+    )
+}
+```
+
+# input
+```{r}
+trial_summary_behavior <- read.csv('./data/multispout_behavior_optoinhibition/data_trial_summary.csv') %>%
+  format_group_combined() %>%
+  format_vars()
+
+
+trial_summary_behavior_session <- trial_summary_behavior %>%
+  format_group_combined() %>%
+  group_by(group_combined, subject, solution, stim_id) %>%
+  summarise(
+    lick_count = lick_count %>% mean(),
+    lick_prop = sum(trial_lick) / n()
+    ) 
+
+
+  
+  
+
+```
+
+# inhibition behavior
+
+## mean trial lick count
+```{r}
+dir_output <- './analysis_output/multispout_behavior_optoinhibition/'
+save_str <- 'stim_vs_lickcount_line'
+
+plt_data <- trial_summary_behavior_session
+
+plt_data %>%
+
+  ggplot(aes(stim_id, lick_count, color = solution)) +
+  annotate("rect", xmin = 1.75, xmax = 2.25, ymin = -Inf, ymax = Inf, alpha = 1/3, fill = "lightblue") +
+  geom_line(aes(group = interaction(subject, solution)), alpha = 1/3) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = solution)) +
+  stat_summary(fun.data = 'mean_se', geom = 'errorbar', aes(group = solution), width = 0.1) +
+  facet_grid(.~group_combined) +
+  theme_ag01() +
+  theme(strip.text = element_text(margin = margin(b = 10)))+
+  coord_cartesian(xlim = c(0.5, 2.5), ylim = c(0,25), expand = F) +
+  force_panelsizes(rows = unit(plt_dims[1], 'cm'), cols = unit(plt_dims[2]/3, 'cm')) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3)) +
+  scale_color_manual(values = c('red', 'black')) +
+  xlab('') +
+  ylab('Mean trial lick count')
+
+
+save_pdf(dir_output, str_c(save_str, '.pdf'), 8, 8)
+write_csv(plt_data, str_c(dir_output, save_str, '_data.csv'))
+```
+
+
+
+
+```{r}
+stats_list <- trial_summary_behavior_session %>%
+  aov_rm_one_between_two_within(dir_output,save_str,'subject','lick_count','group_combined','solution','stim_id')
+
+
+stats_list[[3]] %>%
+  filter(
+    contrast1_within1 == contrast2_within1,
+    contrast1_between == contrast2_between,
+    contrast1_within1 == contrast2_within1
+    
+    ) %>%
+  select(starts_with('contrast'), sig_symbol)
+```
+
+```{r}
+trial_summary_behavior_session %>%
+  filter(group_combined %in% c('control', 'vgat_inh')) %>%
+  filter(solution == 'Water') %>%
+  aov_rm_one_between_one_within(NA,NA,'subject','lick_count','group_combined','stim_id')
+```
+
+
+```{r}
+trial_summary_behavior_session %>%
+  filter(group_combined %in% c('control', 'vgat_inh')) %>%
+  filter(solution == '1M NaCl') %>%
+  aov_rm_one_between_one_within(NA,NA,'subject','lick_count','group_combined','stim_id')
+```
+
+
+```{r}
+trial_summary_behavior_session %>%
+  filter(group_combined %in% c('control', 'vglut2_inh')) %>%
+  filter(solution == 'Water') %>%
+  aov_rm_one_between_one_within(NA,NA,'subject','lick_count','group_combined','stim_id')
+```
+
+
+```{r}
+trial_summary_behavior_session %>%
+  filter(group_combined %in% c('control', 'vglut2_inh')) %>%
+  filter(solution == '1M NaCl') %>%
+  aov_rm_one_between_one_within(NA,NA,'subject','lick_count','group_combined','stim_id')
+```
+
+
+
+# lick rasters opto behavior
+```{r}
+dir_arduino_processed <- 'C:/Users/stuberadmin/Dropbox/post_doc/experiments/abo/data/arduino/processed/'
+dir_arduino_extracted <- 'C:/Users/stuberadmin/Dropbox/post_doc/experiments/abo/data/arduino/extracted/'
+
+import_fns <- log_npm %>%
+  filter(experiment %in% c('acd')) %>%
+  filter(procedure == 'water_nacl_opto') %>%
+  filter(exclude == 0) %>%
+  pull(blockname)  %>%
+  unique()
+
+data_list <- combined_import(import_directory = dir_arduino_processed,
+                             filter_strings = import_fns,
+                             prefixes = NA,
+                             suffixes = c('_data_trial.csv', '_data_trial_binned.csv', '_data_trial_summary.csv')
+)
+
+data_trial <- data_list[[1]]
+data_trial_binned <- data_list[[2]]
+data_trial_summary <- data_list[[3]]
+
+```
+
+
+```{r}
+log_opto_stim_ids <- suppressWarnings(
+  read_sheet("https://docs.google.com/spreadsheets/d/1x0O82yfHucLKToSwA5IU38FnBFcSAg_tdZwx-depFZI", 
+             sheet = 'opto_stimulation_ids', 
+             na = c('NA', '')
+             )
+  )%>%
+  select(-today) %>%
+  filter(experiment %in% manual_experiments)
+
+trial_stim_ids <- return_trial_ids(dir_arduino_extracted, import_fns, file_format_output, filt_last = 0) %>%
+  left_join(log_data_multi %>%
+              select(blockname, experiment, date, subject)) %>%
+  #mutate(trial_stim_id = trial_stim_id + 1) %>%
+  left_join(log_opto_stim_ids %>%
+              select(experiment, date, subject, trial_stim_id, stim_power_uw, pulse_frequency, delay, region, id))
+```
+
+```{r}
+data_trial <- data_trial %>%
+  left_join(trial_stim_ids %>% select(blockname, trial_num, id)) %>%
+  mutate(stim_id = ifelse(is.na(id), 'No Stim', 'Stim'))
+
+data_trial_binned <- data_trial_binned %>%
+  left_join(trial_stim_ids %>% select(blockname, trial_num, id)) %>%
+  mutate(stim_id = ifelse(is.na(id), 'No Stim', 'Stim'))
+
+
+data_trial_summary<- data_trial_binned %>%
+  left_join(trial_stim_ids %>% select(blockname, trial_num, id)) %>%
+  mutate(stim_id = ifelse(is.na(id), 'No Stim', 'Stim'))
+```
+
+
+
+example subjects
+- acd 06 (control)
+- acd 17 (vgat)
+- acd 11 (vglut2)
+
+```{r, fig.width = 12, fig.height = 6}
+dir_output <- './analysis_output/multispout_behavior_optoinhibition/'
+save_str <- 'time_vs_trialsorted_raster'
+
+join_trial_num_solution_stim <- data_trial_summary %>%
+  select(blockname, solution, stim_id, trial_num) %>%
+  unique()%>% 
+  group_by(blockname, solution, stim_id) %>%
+  mutate(trial_num_solution_stim = row_number()) 
+
+data_plt <- data_trial %>%
+  mutate(lick_number = row_number()) %>%
+  left_join(join_trial_num_solution_stim) %>%
+  mutate(solution = str_c(solution, stim_id)) %>%
+  filter(blockname %in% c('2024_05_29_acd06', '2024_05_29_acd11', '2024_05_29_acd14')) %>%
+  mutate(group_combined = case_when(
+    blockname == '2024_05_29_acd06' ~ 'control', 
+    blockname == '2024_05_29_acd11' ~ 'vglut_inh',
+    blockname == '2024_05_29_acd14' ~ 'vgat_inh',
+  ))
+
+
+
+plt_raster(
+  df = data_plt,
+  x = 'event_ts_rel',
+  y = 'trial_num_solution_stim',
+  id = 'subject',
+  facet_x = 'group_combined',
+  facet_y = 'solution',
+  xlab = 'Time (ms)',
+  ylab = 'Trial Number',
+  plt_y_lims = c(0,40),
+  plt_x_lims = c(0,3000),
+  plt_dims = c(2,1.5), 
+  var_color = 'stim_id', 
+  plt_scale_color = 'mako'
+  ) +
+  scale_color_manual(values = c('black', '#00B0F0'))
+
+
+
+save_pdf(dir_output, str_c(save_str, '.pdf'), 8, 8)
+write_csv(data_plt, str_c(dir_output, save_str, '_data.csv'))
+```
+
+
+
+```{r}
+dir_output <- './analysis_output/multispout_behavior_optoinhibition/'
+save_str <- 'time_vs_binnedlickrate'
+
+data_plt <- data_trial_binned  %>%
+  mutate(binned_lick_rate = count_binned / (time_bin_width / 1000),
+         time_bin = time_bin / 1000) %>%
+  left_join(log_npm %>% select(blockname, subject)) %>%
+  left_join(log_subject %>% select(subject, line, group)) %>%
+  format_group_combined()
+
+
+
+plt <- data_plt %>%
+  ggplot(aes(time_bin, binned_lick_rate, color = stim_id, fill = stim_id)) +
+  stat_summary(fun.data = 'mean_se', geom = 'ribbon', aes(group = stim_id), alpha = 1/3, color = NA) +
+  stat_summary(fun = 'mean', geom = 'line', aes(group = stim_id)) +
+  scale_color_manual(values = c('black', '#00B0F0')) +
+  scale_fill_manual(values = c('black', '#00B0F0')) +
+  scale_y_continuous(breaks = c(0,2)) +
+  scale_x_continuous(breaks = c(0,1)) +
+  theme_ag01() +
+  facet_grid(solution~group_combined) +
+  force_panelsizes(rows = unit(3, "cm"),
+                  cols = unit(2, "cm")) +
+  xlab('Time (ms)') +
+  ylab('Lick Rate (Hz)') 
+
+plt %>%
+  add_scale_bar(
+    origin = c(0, 0), 
+    x_len = 1, 
+    y_len = 2
+  )
+
+save_pdf(dir_output, str_c(save_str, '.pdf'), 8, 8)
+write_csv(data_plt, str_c(dir_output, save_str, '_data.csv'))
+
+data_plt %>%  select(blockname, trial_num) %>% unique() %>% ungroup() %>% summarise(count = n()) %>%
+  write_csv(str_c(dir_output, save_str, '_data_samplecount.csv'))
+
+```
+
+
+
+
+
+
